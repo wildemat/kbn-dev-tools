@@ -1,0 +1,962 @@
+#!/bin/bash
+# ---------------------------------------------------------------------------
+# kbn-dev — spin up Kibana + Elasticsearch for both serverless and stateful
+#
+# Run from the ROOT of your kibana repo checkout:
+#   yarn kbn-dev
+#
+# Optional environment variables:
+#   CHROME_BIN            Path to Google Chrome executable. Auto-detected if
+#                         not set (checks standard macOS/Linux locations).
+#                         Override: export CHROME_BIN="/path/to/google-chrome"
+#   KBN_LOG_DIR           Directory for log files.
+#                         Default: ~/.kbn/logs
+#   KBN_INFERENCE_URL     Elastic inference service URL.
+#                         Default: "https://inference.eu-west-1.aws.svc.qa.elastic.cloud"
+#                         Set to "" to disable EIS entirely.
+#                         When enabled, vault access is verified upfront and
+#                         'node scripts/eis.js' runs after each ES cluster is ready.
+#   KIBANA_EIS_CCM_API_KEY  If set, this API key is used directly and vault is
+#                         skipped. Useful for CI or when vault is unavailable.
+#   SKIP_BROWSER_LAUNCH   Set to any value to skip Chrome profile setup and
+#                         browser launch entirely.
+#
+# Flags:
+#   --clean               Wipe .es/cache and run `yarn kbn clean` before boot.
+#   --quiet               Skip the tmux log viewer (on by default).
+#
+# Prerequisites:
+#   - Node.js (nvm is detected automatically if installed)
+#   - yarn (ships with the kibana repo via corepack/volta/etc.)
+#   - Docker running (required by `yarn es`)
+#   - Google Chrome (auto-detected, or set CHROME_BIN)
+#   - Ports 5601, 5611, 9200, 9201, 9300, 9301 must be free
+#   - vault CLI (for EIS; skip with KIBANA_EIS_CCM_API_KEY or KBN_INFERENCE_URL="")
+# ---------------------------------------------------------------------------
+
+# --- Detect interactive mode ------------------------------------------------
+# Non-interactive when stdin is not a terminal (piped, run by agent, CI, etc.).
+# Interactive prompts auto-accept and verbose banners are suppressed.
+INTERACTIVE=true
+[ -t 0 ] || INTERACTIVE=false
+SHUTTING_DOWN=false
+
+# =============================================================================
+# Utility functions
+# =============================================================================
+
+log_step() {
+  [ "$SHUTTING_DOWN" = true ] && return
+  local msg="$1"
+  local logfile="${2:-}"
+  local line
+  line="[$(date '+%Y-%m-%d %H:%M:%S')] $msg"
+  echo -e "\n$line"
+  [ -n "$logfile" ] && echo -e "\n$line" >> "$logfile"
+}
+
+wait_for_log() {
+  local logfile="$1" pattern="$2" pid="$3" label="$4"
+  while true; do
+    grep -q "$pattern" "$logfile" 2>/dev/null && return 0
+    if [ -n "$pid" ] && ! kill -0 "$pid" 2>/dev/null; then
+      log_step "ERROR: $label process died. Check $logfile"
+      return 1
+    fi
+    sleep 2
+  done
+}
+
+wait_for_kibana() {
+  local label="$1" logfile="$2" es_pid="$3" kbn_pidfile="$4" port="${5:-}"
+  local kbn_pid
+
+  log_step "Waiting for $label to become available..."
+  while true; do
+    if grep -q "\[INFO \]\[status\] Kibana is now available" "$logfile" 2>/dev/null; then
+      log_step "$label is available!"
+      return 0
+    fi
+    # Also check via HTTP — the log grep can miss if log is buffered
+    if [ -n "$port" ]; then
+      local http_code
+      http_code=$(curl -s -o /dev/null -w "%{http_code}" "http://localhost:$port/api/status" 2>/dev/null || echo "000")
+      if [ "$http_code" = "200" ] || [ "$http_code" = "302" ]; then
+        log_step "$label is available! (detected via HTTP $http_code)"
+        return 0
+      fi
+    fi
+    if ! kill -0 "$es_pid" 2>/dev/null && [ ! -f "$kbn_pidfile" ]; then
+      log_step "FAILED: ES died and $label was never started."
+      return 1
+    fi
+    if [ -f "$kbn_pidfile" ]; then
+      kbn_pid=$(cat "$kbn_pidfile" 2>/dev/null)
+      if [ -n "$kbn_pid" ] && ! kill -0 "$kbn_pid" 2>/dev/null; then
+        # Double-check: the monitor PID might be orphaned from the pipeline
+        # subshell. Check if the port is listening as a fallback.
+        if [ -n "$port" ] && lsof -ti "tcp:$port" >/dev/null 2>&1; then
+          sleep 2
+          continue
+        fi
+        log_step "FAILED: $label monitor died. Check $logfile"
+        return 1
+      fi
+    fi
+    sleep 2
+  done
+}
+
+kill_tree() {
+  local pid="$1"
+  if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+    pkill -P "$pid" 2>/dev/null || true
+    kill "$pid" 2>/dev/null || true
+  fi
+}
+
+kill_port() {
+  local port="$1"
+  local pid
+  pid=$(lsof -ti "tcp:$port" 2>/dev/null)
+  if [ -n "$pid" ]; then
+    log_step "Clearing stale process $pid on port $port"
+    kill -9 "$pid" 2>/dev/null || true
+    sleep 1
+  fi
+}
+
+write_status() {
+  local state="$1"
+  shift
+  local ts
+  ts=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+
+  cat > "$LOG_DIR/status.json" <<STATUSEOF
+{
+  "state": "$state",
+  "updated": "$ts",
+  "pid": $$,
+  "log_dir": "$LOG_DIR",
+  "kbn_dir": "$KBN_DIR",
+  "clean": $CLEAN_CACHE,
+  "eis": $([ -n "$INFERENCE_FLAG" ] && echo "true" || echo "false"),
+  "components": {
+    "essls":     { "pid": "${ESSLS_PID:-null}",     "log": "$ESSLS_LOG",     "port": 9200 },
+    "esstack":   { "pid": "${ESSTACK_PID:-null}",   "log": "$ESSTACK_LOG",   "port": 9201 },
+    "optimizer": { "pid": "${OPTIMIZER_PID:-null}",  "log": "$OPTIMIZER_LOG"  },
+    "kbnsls":    { "pid": "${KBNSLS_PID:-null}",    "log": "$KBNSLS_LOG",    "port": 5601, "url": "http://localhost:5601" },
+    "kbnstack":  { "pid": "${KBNSTACK_PID:-null}",  "log": "$KBNSTACK_LOG",  "port": 5611, "url": "http://localhost:5611" }
+  }$([ $# -gt 0 ] && echo ","; for kv in "$@"; do echo "  $kv"; done)
+}
+STATUSEOF
+}
+
+# =============================================================================
+# Pre-flight checks (before anything starts)
+# =============================================================================
+
+# --- Intro banner (interactive only) ----------------------------------------
+if [ "$INTERACTIVE" = true ]; then
+  cat <<'BANNER'
+
+=============================================
+ kbn-dev — Kibana dual-mode dev launcher
+=============================================
+
+ Spins up Elasticsearch (serverless + stateful) and two Kibana
+ instances in parallel, with an optimizer in watch mode.
+
+ Prerequisites:
+   Node.js    nvm is detected automatically from .nvmrc
+   yarn       ships with the kibana repo (corepack/volta)
+   Docker     required by 'yarn es' for ES clusters
+   Chrome     auto-detected, or set CHROME_BIN
+   vault      required for EIS (skip with KIBANA_EIS_CCM_API_KEY
+              or KBN_INFERENCE_URL="")
+
+ Environment variables:
+   KBN_INFERENCE_URL        EIS inference service URL
+   KIBANA_EIS_CCM_API_KEY   Provide EIS API key directly (skips vault)
+   CHROME_BIN               Path to Chrome binary (auto-detected if unset)
+   KBN_LOG_DIR              Log directory. Default: ~/.kbn/logs
+   SKIP_BROWSER_LAUNCH      Set to any value to skip Chrome launch
+
+ Flags:
+   --clean                  Wipe .es/cache and run 'yarn kbn clean'
+   --quiet                  Skip the tmux log viewer (on by default)
+
+=============================================
+
+BANNER
+fi
+
+# --- Repo root check -------------------------------------------------------
+if [ ! -f "package.json" ] || ! grep -q '"name": "kibana"' package.json 2>/dev/null; then
+  echo "ERROR: This script must be run from the root of the kibana repo."
+  echo "  yarn kbn-dev"
+  exit 1
+fi
+KBN_DIR="$(pwd)"
+
+# --- Node version setup ----------------------------------------------------
+# Detect whichever version manager is installed and activate the .nvmrc
+# version. Then pin the resolved node binary at the front of PATH so
+# backgrounded subshells can never fall back to a different version.
+setup_node() {
+  # Already correct? Skip.
+  if [ -f ".nvmrc" ] && command -v node >/dev/null 2>&1; then
+    local want="v$(cat .nvmrc 2>/dev/null)"
+    local have="$(node --version 2>/dev/null)"
+    [ "$want" = "$have" ] && return 0
+  fi
+
+  # nvm
+  if [ -s "${NVM_DIR:-$HOME/.nvm}/nvm.sh" ]; then
+    export NVM_DIR="${NVM_DIR:-$HOME/.nvm}"
+    # shellcheck disable=SC1091
+    . "$NVM_DIR/nvm.sh"
+    nvm use
+    [ -n "${NVM_BIN:-}" ] && export PATH="$NVM_BIN:$PATH"
+    return 0
+  fi
+
+  # fnm
+  if command -v fnm >/dev/null 2>&1; then
+    eval "$(fnm env --shell bash 2>/dev/null)" || true
+    [ -f ".nvmrc" ] && fnm use --silent-if-unchanged 2>/dev/null || true
+    return 0
+  fi
+
+  # volta (auto-activates based on package.json, no explicit use needed)
+  if command -v volta >/dev/null 2>&1; then
+    return 0
+  fi
+
+  # mise (formerly rtx)
+  if command -v mise >/dev/null 2>&1; then
+    eval "$(mise activate bash 2>/dev/null)" || true
+    return 0
+  fi
+
+  # asdf
+  if [ -s "${ASDF_DIR:-$HOME/.asdf}/asdf.sh" ]; then
+    # shellcheck disable=SC1091
+    . "${ASDF_DIR:-$HOME/.asdf}/asdf.sh" 2>/dev/null || true
+    return 0
+  fi
+}
+setup_node
+
+if ! command -v node >/dev/null 2>&1; then
+  echo "ERROR: node is not available. Install Node.js (via nvm, fnm, volta, mise, or asdf), then retry."
+  exit 1
+fi
+
+EXPECTED_NODE="v$(cat .nvmrc 2>/dev/null)"
+ACTUAL_NODE="$(node --version 2>/dev/null)"
+if [ "$EXPECTED_NODE" != "$ACTUAL_NODE" ]; then
+  echo "ERROR: Expected node $EXPECTED_NODE (from .nvmrc) but got $ACTUAL_NODE"
+  echo "  Your node version manager may not have switched correctly."
+  echo "  Try: nvm install $(cat .nvmrc)  OR  fnm install $(cat .nvmrc)"
+  exit 1
+fi
+
+# --- Parse flags ------------------------------------------------------------
+CLEAN_CACHE=false
+SHOW_LOGS=true
+for arg in "$@"; do
+  case $arg in
+    --clean)        CLEAN_CACHE=true; shift ;;
+    --quiet) SHOW_LOGS=false; shift ;;
+    *) ;;
+  esac
+done
+
+# --- Chrome profile setup --------------------------------------------------
+LAUNCH_BROWSER=true
+CHROME_PROFILE_DIR="$HOME/.kbn-chrome"
+SLS_PROFILE="$CHROME_PROFILE_DIR/kbn-sls"
+STACK_PROFILE="$CHROME_PROFILE_DIR/kbn-stack"
+
+detect_chrome() {
+  local candidates=(
+    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+    "/Applications/Google Chrome Canary.app/Contents/MacOS/Google Chrome Canary"
+  )
+  for c in "${candidates[@]}"; do
+    [ -f "$c" ] && echo "$c" && return
+  done
+  for c in google-chrome google-chrome-stable chromium-browser chromium; do
+    command -v "$c" >/dev/null 2>&1 && command -v "$c" && return
+  done
+  return 1
+}
+
+if [ -n "$SKIP_BROWSER_LAUNCH" ]; then
+  [ "$INTERACTIVE" = true ] && echo "SKIP_BROWSER_LAUNCH is set — skipping Chrome setup."
+  LAUNCH_BROWSER=false
+elif [ -n "$CHROME_BIN" ]; then
+  CHROME_BIN_CLEAN="${CHROME_BIN//\\/}"
+  if [ "$CHROME_BIN_CLEAN" != "$CHROME_BIN" ] && [ -f "$CHROME_BIN_CLEAN" ]; then
+    echo "NOTE: Stripped backslashes from CHROME_BIN (use plain spaces inside double quotes)."
+    echo "  Was: $CHROME_BIN"
+    echo "  Now: $CHROME_BIN_CLEAN"
+    CHROME_BIN="$CHROME_BIN_CLEAN"
+  fi
+
+  if [ ! -f "$CHROME_BIN" ] && ! command -v "$CHROME_BIN" >/dev/null 2>&1; then
+    echo "WARNING: CHROME_BIN='$CHROME_BIN' was not found."
+    LAUNCH_BROWSER=false
+  fi
+else
+  if detected=$(detect_chrome); then
+    CHROME_BIN="$detected"
+    echo "Auto-detected Chrome: $CHROME_BIN"
+  else
+    [ "$INTERACTIVE" = true ] && echo "WARNING: Chrome was not found. Open Kibana URLs manually."
+    LAUNCH_BROWSER=false
+  fi
+fi
+
+if [ "$LAUNCH_BROWSER" = true ]; then
+  need_sls=false
+  need_stack=false
+  [ ! -d "$SLS_PROFILE" ] && need_sls=true
+  [ ! -d "$STACK_PROFILE" ] && need_stack=true
+
+  if [ "$need_sls" = true ] || [ "$need_stack" = true ]; then
+    if [ "$INTERACTIVE" = true ]; then
+      echo ""
+      echo "Chrome profiles needed for independent Kibana logins:"
+      [ "$need_sls" = true ]   && echo "  kbn-sls   (serverless)  -> $SLS_PROFILE   [not found]"
+      [ "$need_stack" = true ]  && echo "  kbn-stack (stateful)    -> $STACK_PROFILE  [not found]"
+      echo ""
+      read -r -p "  Create missing profile(s)? [Y/n] " answer
+    else
+      answer="y"
+    fi
+
+    case "$answer" in
+      [nN]*)
+        echo "  Skipping. Open Kibana manually at the URLs printed at the end."
+        LAUNCH_BROWSER=false
+        ;;
+      *)
+        profile_ok=true
+        for prof_dir in \
+          $([ "$need_sls" = true ] && echo "$SLS_PROFILE") \
+          $([ "$need_stack" = true ] && echo "$STACK_PROFILE"); do
+          if mkdir -p "$prof_dir" 2>/dev/null; then
+            echo "  Created: $prof_dir"
+          else
+            echo "  ERROR: Could not create $prof_dir"
+            profile_ok=false
+          fi
+        done
+        [ "$profile_ok" = false ] && LAUNCH_BROWSER=false
+        ;;
+    esac
+    echo ""
+  fi
+fi
+
+LAST_CHROME_PID=""
+open_chrome() {
+  local url="$1" profile="$2"
+  LAST_CHROME_PID=""
+  if [ "$LAUNCH_BROWSER" = true ]; then
+    log_step "Opening Chrome: $url (profile: $(basename "$profile"))"
+    if [[ "$OSTYPE" == darwin* ]]; then
+      open -na "Google Chrome" --args --new-window --user-data-dir="$profile" "$url" &
+    else
+      "$CHROME_BIN" --new-window --user-data-dir="$profile" "$url" 2>/dev/null &
+    fi
+    LAST_CHROME_PID=$!
+  fi
+}
+
+# --- Logging ----------------------------------------------------------------
+LOG_DIR="${KBN_LOG_DIR:-$HOME/.kbn/logs}"
+mkdir -p "$LOG_DIR"
+
+# --- Kill previous instance -------------------------------------------------
+PIDFILE="$LOG_DIR/kbn.pid"
+if [ -f "$PIDFILE" ]; then
+  OLD_PID=$(cat "$PIDFILE" 2>/dev/null)
+  if [ -n "$OLD_PID" ] && kill -0 "$OLD_PID" 2>/dev/null; then
+    echo "Stopping previous kbn-dev instance (PID $OLD_PID)..."
+    pkill -P "$OLD_PID" 2>/dev/null || true
+    kill "$OLD_PID" 2>/dev/null || true
+    sleep 2
+  fi
+fi
+echo $$ > "$PIDFILE"
+
+# --- PID tracking -----------------------------------------------------------
+OPTIMIZER_PID=""
+ESSLS_PID=""
+ESSTACK_PID=""
+KBNSLS_PID=""
+KBNSTACK_PID=""
+SLS_CHROME_PID=""
+STACK_CHROME_PID=""
+
+# --- Cleanup on exit --------------------------------------------------------
+cleanup() {
+  SHUTTING_DOWN=true
+  set +m 2>/dev/null
+  echo ""
+  echo "Stopping all processes..."
+
+  # Chrome
+  for profile_dir in "$SLS_PROFILE" "$STACK_PROFILE"; do
+    if [ -n "$profile_dir" ]; then
+      local chrome_pids
+      chrome_pids=$(pgrep -f "user-data-dir=$profile_dir" 2>/dev/null || true)
+      if [ -n "$chrome_pids" ]; then
+        echo "  Closing Chrome (profile: $(basename "$profile_dir"))"
+        echo "$chrome_pids" | xargs kill 2>/dev/null || true
+      fi
+    fi
+  done
+
+  # Kill Kibana node processes by port
+  for port in 5601 5611; do
+    local port_pid
+    port_pid=$(lsof -ti "tcp:$port" 2>/dev/null)
+    if [ -n "$port_pid" ]; then
+      echo "  Killing Kibana on port $port (PID $port_pid)"
+      kill "$port_pid" 2>/dev/null || true
+    fi
+  done
+
+  # Kill tracked PIDs and their children
+  for pid in $KBNSLS_PID $KBNSTACK_PID $OPTIMIZER_PID $ESSLS_PID $ESSTACK_PID; do
+    kill_tree "$pid"
+  done
+
+  sleep 2
+
+  # Force-kill anything still alive
+  for pid in $KBNSLS_PID $KBNSTACK_PID $OPTIMIZER_PID $ESSLS_PID $ESSTACK_PID; do
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+      echo "  Force-killing PID $pid"
+      pkill -9 -P "$pid" 2>/dev/null || true
+      kill -9 "$pid" 2>/dev/null || true
+    fi
+  done
+
+  # Kill any remaining node processes on Kibana ports
+  for port in 5601 5611; do
+    local port_pid
+    port_pid=$(lsof -ti "tcp:$port" 2>/dev/null)
+    if [ -n "$port_pid" ]; then
+      echo "  Force-killing orphan on port $port (PID $port_pid)"
+      kill -9 "$port_pid" 2>/dev/null || true
+    fi
+  done
+
+  # Stop ES Docker containers
+  if command -v docker >/dev/null 2>&1; then
+    local containers
+    containers=$(docker ps -q --filter "name=es01" --filter "name=es02" --filter "name=es03" --filter "name=uiam" --filter "name=uiam-cosmosdb" 2>/dev/null | xargs)
+    if [ -n "$containers" ]; then
+      echo "  Stopping Docker containers: $containers"
+      # shellcheck disable=SC2086
+      docker stop $containers 2>/dev/null || true
+      # shellcheck disable=SC2086
+      docker rm -f $containers 2>/dev/null || true
+    fi
+  fi
+
+  wait 2>/dev/null
+
+  if command -v tmux >/dev/null 2>&1 && tmux has-session -t kbn-logs 2>/dev/null; then
+    echo "  Killing tmux session 'kbn-logs'..."
+    tmux kill-session -t kbn-logs 2>/dev/null || true
+  fi
+
+  write_status "stopped"
+  rm -f "$PIDFILE" "$LOG_DIR/kbnsls.pid" "$LOG_DIR/kbnstack.pid"
+  echo "Cleanup complete."
+  exit
+}
+trap cleanup SIGINT SIGTERM
+
+# --- Log files --------------------------------------------------------------
+ESSLS_LOG="$LOG_DIR/essls.log"
+ESSTACK_LOG="$LOG_DIR/esstack.log"
+KBNSLS_LOG="$LOG_DIR/kbnsls.log"
+KBNSTACK_LOG="$LOG_DIR/kbnstack.log"
+OPTIMIZER_LOG="$LOG_DIR/optimizer.log"
+MAIN_LOG="$LOG_DIR/main.log"
+for f in "$ESSLS_LOG" "$ESSTACK_LOG" "$KBNSLS_LOG" "$KBNSTACK_LOG" "$OPTIMIZER_LOG" "$MAIN_LOG"; do
+  rm -f "$f"; touch "$f"
+done
+
+# --- Build inference flag ---------------------------------------------------
+KBN_INFERENCE_URL="${KBN_INFERENCE_URL:-https://inference.eu-west-1.aws.svc.qa.elastic.cloud}"
+INFERENCE_FLAG=""
+if [ -n "$KBN_INFERENCE_URL" ]; then
+  INFERENCE_FLAG="-E xpack.inference.elastic.url=$KBN_INFERENCE_URL"
+fi
+
+# --- Vault pre-check for EIS -----------------------------------------------
+EIS_VAULT_ADDR="${VAULT_ADDR:-https://secrets.elastic.co:8200}"
+EIS_VAULT_SECRET="secret/kibana-issues/dev/inference/kibana-eis-ccm"
+
+setup_eis_vault() {
+  if [ -z "$INFERENCE_FLAG" ]; then
+    return
+  fi
+
+  if [ -n "$KIBANA_EIS_CCM_API_KEY" ]; then
+    echo "  EIS enabled — using KIBANA_EIS_CCM_API_KEY (vault skipped)."
+    return
+  fi
+
+  echo ""
+  echo "============================================="
+  echo " EIS — Cloud Connected Mode"
+  echo "============================================="
+  echo ""
+  echo "  URL:     $KBN_INFERENCE_URL"
+  echo "  Vault:   $EIS_VAULT_ADDR"
+  echo "  Secret:  $EIS_VAULT_SECRET"
+  echo ""
+
+  if ! command -v vault >/dev/null 2>&1; then
+    echo "  ERROR: 'vault' CLI not found."
+    echo "  To fix: install vault, set KIBANA_EIS_CCM_API_KEY, or set KBN_INFERENCE_URL=\"\""
+    echo "  Continuing without EIS."
+    INFERENCE_FLAG=""
+    return
+  fi
+
+  while true; do
+    if VAULT_ADDR="$EIS_VAULT_ADDR" vault read -field key "$EIS_VAULT_SECRET" >/dev/null 2>&1; then
+      echo "  Vault access confirmed. EIS will run after each ES cluster is ready."
+      break
+    fi
+
+    if [ "$INTERACTIVE" = false ]; then
+      echo "  Vault access failed (non-interactive). Continuing without EIS."
+      INFERENCE_FLAG=""
+      return
+    fi
+
+    echo "  Vault access failed. Log in with:"
+    echo ""
+    echo "    VAULT_ADDR=$EIS_VAULT_ADDR vault login -method oidc"
+    echo ""
+    read -r -p "  Press Enter after logging in to retry (or Ctrl+C to abort)... "
+    echo ""
+  done
+  echo ""
+  echo "============================================="
+}
+
+setup_eis_vault
+
+# --- Print config summary ---------------------------------------------------
+open_tmux_logs() {
+  tmux kill-session -t kbn-logs 2>/dev/null || true
+  tmux new-session -d -s kbn-logs -n logs \
+    "tail -f $ESSLS_LOG" \; \
+    select-pane -T "ES Serverless" \; \
+    split-window -h \
+    "tail -f $ESSTACK_LOG" \; \
+    select-pane -T "ES Stateful" \; \
+    split-window -v \
+    "tail -f $KBNSTACK_LOG" \; \
+    select-pane -T "Kibana Stack" \; \
+    select-pane -t 0 \; \
+    split-window -v \
+    "tail -f $KBNSLS_LOG" \; \
+    select-pane -T "Kibana SLS" \; \
+    select-layout tiled \; \
+    set pane-border-status top \; \
+    set pane-border-format " #{pane_index}: #{pane_title} "
+}
+
+echo "============================================="
+echo " kbn-dev: Kibana dual-mode dev launcher"
+echo "============================================="
+echo "  Repo:      $KBN_DIR"
+echo "  Clean:     $CLEAN_CACHE"
+echo "  EIS:       $([ -n "$INFERENCE_FLAG" ] && echo "enabled ($KBN_INFERENCE_URL)" || echo "disabled")"
+echo "  Browser:   $([ "$LAUNCH_BROWSER" = true ] && echo "Chrome (kbn-sls + kbn-stack profiles)" || echo "disabled")"
+echo "  Show logs: $SHOW_LOGS"
+echo "============================================="
+echo ""
+echo " LOGGING"
+echo "  Dir: $LOG_DIR"
+echo "  Override with: KBN_LOG_DIR=/your/path"
+if [ "$SHOW_LOGS" = true ]; then
+  if command -v tmux >/dev/null 2>&1; then
+    echo "  Tmux log viewer will open automatically (--quiet to disable)."
+    echo "  Attach:  tmux attach -t kbn-logs"
+    echo "  Detach:  Ctrl+B then D"
+    echo "  Kill:    tmux kill-session -t kbn-logs"
+  else
+    echo "  WARNING: tmux not found. Install tmux for the log viewer."
+    echo "  Falling back to individual tail commands."
+    SHOW_LOGS=false
+  fi
+fi
+echo ""
+echo "============================================="
+
+if [ "$SHOW_LOGS" = true ]; then
+  open_tmux_logs
+  echo ""
+  echo "  tmux session 'kbn-logs' opened. Attach in another terminal:"
+  echo ""
+  echo "    tmux attach -t kbn-logs"
+  echo ""
+fi
+
+write_status "starting"
+
+# =============================================================================
+# PHASE 1: Check ports + start Elasticsearch clusters in parallel
+# =============================================================================
+
+log_step "Cleaning up stale kibana-ci Docker resources..."
+if command -v docker >/dev/null 2>&1; then
+  stale_ids=$(docker ps -aq --filter "label=org.opencontainers.image.url=https://github.com/elastic/kibana" 2>/dev/null)
+  if [ -z "$stale_ids" ]; then
+    for img in uiam uiam-azure-cosmos-emulator elasticsearch-serverless; do
+      stale_ids="$stale_ids $(docker ps -aq --filter "ancestor=docker.elastic.co/kibana-ci/$img:latest-verified" 2>/dev/null)"
+    done
+  fi
+  stale_ids=$(echo "$stale_ids" | xargs)
+  if [ -n "$stale_ids" ]; then
+    echo "  Removing containers: $stale_ids"
+    # shellcheck disable=SC2086
+    docker rm -f $stale_ids 2>/dev/null || true
+  else
+    echo "  No stale containers."
+  fi
+
+  dangling=$(docker images -q --filter "dangling=true" --filter "reference=docker.elastic.co/kibana-ci/*" 2>/dev/null | xargs)
+  if [ -n "$dangling" ]; then
+    echo "  Removing dangling images: $dangling"
+    # shellcheck disable=SC2086
+    docker rmi $dangling 2>/dev/null || true
+  fi
+
+  # Remove stale 'elastic' Docker network — stale DNS entries from crashed
+  # containers can cause uiam to fail resolving uiam-cosmosdb.
+  docker network rm elastic 2>/dev/null || true
+
+  if [ "$CLEAN_CACHE" = true ]; then
+    echo "  --clean: removing all kibana-ci images (will re-pull)..."
+    # shellcheck disable=SC2046
+    docker rmi $(docker images -q "docker.elastic.co/kibana-ci/*" 2>/dev/null) 2>/dev/null || true
+  fi
+else
+  echo "  Docker not available — skipping."
+fi
+
+log_step "Clearing dev ports..."
+for port in 9200 9201 9300 9301 5601 5611; do
+  pid=$(lsof -ti "tcp:$port" 2>/dev/null)
+  if [ -n "$pid" ]; then
+    proc_name=$(ps -p "$pid" -o comm= 2>/dev/null || echo "unknown")
+    echo "  Killing PID $pid on port $port ($proc_name)"
+    kill "$pid" 2>/dev/null || true
+  fi
+done
+
+if [ "$CLEAN_CACHE" = true ]; then
+  log_step "Cleaning ES cache (.es/cache)..."
+  rm -rf "$KBN_DIR/.es/cache/"
+fi
+
+log_step "Starting ES Serverless..." "$ESSLS_LOG"
+(
+  cd "$KBN_DIR" || exit 1
+
+  # Retry up to 3 times in case of uiam/cosmosdb startup race.
+  # The Docker network cleanup before this step usually prevents the issue.
+  max_attempts=3
+  attempt=0
+  while [ $attempt -lt $max_attempts ]; do
+    attempt=$((attempt + 1))
+    [ $attempt -gt 1 ] && echo "" && echo "[$(date '+%Y-%m-%d %H:%M:%S')] ES Serverless attempt $attempt/$max_attempts..."
+
+    # shellcheck disable=SC2086
+    yarn es serverless \
+      --projectType elasticsearch_general_purpose \
+      --clean --kill \
+      $INFERENCE_FLAG \
+    && break
+
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] ES Serverless attempt $attempt/$max_attempts failed (uiam/cosmosdb startup race)."
+    sleep 5
+  done
+) >> "$ESSLS_LOG" 2>&1 &
+ESSLS_PID=$!
+
+log_step "Starting ES Stateful (snapshot)..." "$ESSTACK_LOG"
+(
+  cd "$KBN_DIR" || exit 1
+  # shellcheck disable=SC2086
+  yarn es snapshot \
+    --license trial --clean \
+    -E http.port=9201 \
+    -E transport.port=9301 \
+    -E xpack.ml.enabled=false \
+    $INFERENCE_FLAG
+) >> "$ESSTACK_LOG" 2>&1 &
+ESSTACK_PID=$!
+
+write_status "es_starting"
+
+# =============================================================================
+# PHASE 2: Bootstrap and build optimizer
+# =============================================================================
+
+(
+  cd "$KBN_DIR" || exit 1
+  if [ "$CLEAN_CACHE" = true ]; then
+    log_step "Running yarn kbn clean..." "$MAIN_LOG"
+    yarn kbn clean || exit 1
+  fi
+  log_step "Running yarn kbn bootstrap..." "$MAIN_LOG"
+  yarn kbn bootstrap || exit 1
+) >> "$MAIN_LOG" 2>&1
+BOOTSTRAP_EXIT=$?
+
+if [ $BOOTSTRAP_EXIT -ne 0 ]; then
+  log_step "ERROR: Bootstrap failed (exit $BOOTSTRAP_EXIT). Check $MAIN_LOG"
+  echo "  Tip: run 'yarn kbn bootstrap' manually to see the full error."
+  cleanup
+fi
+
+log_step "Starting optimizer (watch mode)..."
+(
+  cd "$KBN_DIR" || exit 1
+  node scripts/build_kibana_platform_plugins --watch
+) >> "$OPTIMIZER_LOG" 2>&1 &
+OPTIMIZER_PID=$!
+
+log_step "Waiting for optimizer initial build..."
+if wait_for_log "$OPTIMIZER_LOG" "succ.*bundles compiled successfully\|succ all bundles cached" "$OPTIMIZER_PID" "Optimizer"; then
+  log_step "Optimizer build complete!"
+fi
+
+write_status "optimizer_ready"
+
+# =============================================================================
+# PHASE 3: Wait for ES → run EIS → start Kibana
+# =============================================================================
+
+start_kbnsls() {
+  kill_port 5601
+  log_step "Starting Kibana Serverless (port 5601)..." "$KBNSLS_LOG"
+  (
+    cd "$KBN_DIR" || exit 1
+    export KBN_OPTIMIZER_USE_MAX_AVAILABLE_RESOURCES=false
+    yarn serverless-es \
+      --server.port=5601 \
+      --no-optimizer
+  ) >> "$KBNSLS_LOG" 2>&1
+}
+
+start_kbnstack() {
+  kill_port 5611
+  log_step "Starting Kibana Stateful (port 5611)..." "$KBNSTACK_LOG"
+  (
+    cd "$KBN_DIR" || exit 1
+    export KBN_OPTIMIZER_USE_MAX_AVAILABLE_RESOURCES=false
+    yarn start \
+      --elasticsearch http://localhost:9201 \
+      --server.port=5611 \
+      --xpack.security.cookieName=sid-stack \
+      --no-optimizer
+  ) >> "$KBNSTACK_LOG" 2>&1
+}
+
+monitor_process() {
+  local name="$1" start_fn="$2" logfile="$3"
+  local failures=0 max_failures=3
+
+  while true; do
+    $start_fn &
+    local pid=$!
+    wait $pid
+    local exit_code=$?
+
+    if [ $exit_code -eq 130 ] || [ $exit_code -eq 143 ]; then
+      break
+    elif [ $exit_code -ne 0 ]; then
+      failures=$((failures + 1))
+      log_step "$name exited with code $exit_code (attempt $failures/$max_failures)" "$logfile"
+      if [ $failures -lt $max_failures ]; then
+        log_step "Restarting $name in 5s..."
+        sleep 5
+      else
+        log_step "$name exceeded max retries ($max_failures). Giving up."
+        kill $$ 2>/dev/null
+        exit 1
+      fi
+    else
+      log_step "$name exited cleanly (code 0)"
+      break
+    fi
+  done
+}
+
+run_es_to_kibana_pipeline() {
+  local es_label="$1" es_log="$2" es_pid="$3" es_ready_pattern="$4"
+  local kbn_label="$5" kbn_start_fn="$6" kbn_log="$7" kbn_pidfile="$8"
+
+  log_step "Waiting for $es_label to be ready..."
+  if ! wait_for_log "$es_log" "$es_ready_pattern" "$es_pid" "$es_label"; then
+    return 1
+  fi
+
+  log_step "$es_label is ready!"
+
+  if [ -n "$INFERENCE_FLAG" ]; then
+    log_step "Running EIS setup for $es_label (node scripts/eis.js)..."
+    (cd "$KBN_DIR" && node scripts/eis.js) >> "$MAIN_LOG" 2>&1
+  fi
+
+  monitor_process "$kbn_label" "$kbn_start_fn" "$kbn_log" &
+  echo "$!" > "$kbn_pidfile"
+  wait
+}
+
+# Serverless pipeline (background)
+(
+  run_es_to_kibana_pipeline \
+    "ES Serverless" "$ESSLS_LOG" "$ESSLS_PID" "succ Serverless ES cluster running" \
+    "kbnsls" start_kbnsls "$KBNSLS_LOG" "$LOG_DIR/kbnsls.pid"
+) &
+
+# Stateful pipeline (background)
+(
+  run_es_to_kibana_pipeline \
+    "ES Stateful" "$ESSTACK_LOG" "$ESSTACK_PID" "succ ES cluster is ready" \
+    "kbnstack" start_kbnstack "$KBNSTACK_LOG" "$LOG_DIR/kbnstack.pid"
+) &
+
+# =============================================================================
+# PHASE 4: Wait for Kibana → open browser → report
+# =============================================================================
+
+SLS_READY=false
+STACK_READY=false
+SLS_WAIT_DONE=false
+STACK_WAIT_DONE=false
+
+# Wait for both in parallel using background subshells and marker files
+SLS_MARKER="$LOG_DIR/.sls_ready"
+STACK_MARKER="$LOG_DIR/.stack_ready"
+rm -f "$SLS_MARKER" "$STACK_MARKER"
+
+(
+  if wait_for_kibana "Kibana Serverless" "$KBNSLS_LOG" "$ESSLS_PID" "$LOG_DIR/kbnsls.pid" 5601; then
+    touch "$SLS_MARKER"
+  fi
+) &
+SLS_WAIT_PID=$!
+
+(
+  if wait_for_kibana "Kibana Stateful" "$KBNSTACK_LOG" "$ESSTACK_PID" "$LOG_DIR/kbnstack.pid" 5611; then
+    touch "$STACK_MARKER"
+  fi
+) &
+STACK_WAIT_PID=$!
+
+# Wait for both to finish
+wait $SLS_WAIT_PID 2>/dev/null
+wait $STACK_WAIT_PID 2>/dev/null
+
+if [ -f "$SLS_MARKER" ]; then
+  log_step "Kibana Serverless is available at http://localhost:5601"
+  SLS_READY=true
+  open_chrome "http://localhost:5601" "$SLS_PROFILE"
+  SLS_CHROME_PID="$LAST_CHROME_PID"
+fi
+
+if [ -f "$STACK_MARKER" ]; then
+  log_step "Kibana Stateful is available at http://localhost:5611"
+  STACK_READY=true
+  open_chrome "http://localhost:5611" "$STACK_PROFILE"
+  STACK_CHROME_PID="$LAST_CHROME_PID"
+fi
+
+rm -f "$SLS_MARKER" "$STACK_MARKER"
+
+# --- Read child PIDs --------------------------------------------------------
+[ -f "$LOG_DIR/kbnsls.pid" ]  && KBNSLS_PID=$(cat "$LOG_DIR/kbnsls.pid")
+[ -f "$LOG_DIR/kbnstack.pid" ] && KBNSTACK_PID=$(cat "$LOG_DIR/kbnstack.pid")
+
+# --- Status report ----------------------------------------------------------
+if [ "$SLS_READY" = false ] && [ "$STACK_READY" = false ]; then
+  write_status "failed"
+  echo ""
+  echo "============================================="
+  echo " STARTUP FAILED"
+  echo "============================================="
+  echo ""
+  echo "  Neither Kibana instance came up. Check the logs:"
+  echo "    yarn kbn-dev-ctl logs essls --grep ERROR"
+  echo "    yarn kbn-dev-ctl logs esstack --grep ERROR"
+  echo ""
+  echo "  Common causes: Docker not running, bootstrap needed (--clean), node mismatch."
+  echo ""
+  cleanup
+fi
+
+if [ "$SLS_READY" = false ] || [ "$STACK_READY" = false ]; then
+  echo ""
+  if [ "$SLS_READY" = false ]; then
+    echo "  WARNING: Kibana Serverless failed to start."
+    echo "    Check: yarn kbn-dev-ctl logs essls --grep ERROR"
+  fi
+  if [ "$STACK_READY" = false ]; then
+    echo "  WARNING: Kibana Stateful failed to start."
+    echo "    Check: yarn kbn-dev-ctl logs esstack --grep ERROR"
+  fi
+  echo "  Continuing with available instance(s)."
+  echo ""
+fi
+
+write_status "running"
+
+echo ""
+echo "============================================="
+echo " STATUS"
+echo "============================================="
+echo ""
+[ "$SLS_READY" = true ]   && echo "  [OK]     Kibana Serverless:  http://localhost:5601" \
+                           || echo "  [FAILED] Kibana Serverless — check $KBNSLS_LOG"
+[ "$STACK_READY" = true ]  && echo "  [OK]     Kibana Stateful:    http://localhost:5611" \
+                           || echo "  [FAILED] Kibana Stateful — check $KBNSTACK_LOG"
+echo ""
+echo "  PIDs:"
+echo "    Optimizer:        $OPTIMIZER_PID"
+echo "    ES Serverless:    $ESSLS_PID"
+echo "    ES Stateful:      $ESSTACK_PID"
+echo "    Kibana SLS:       ${KBNSLS_PID:-(not started)}"
+echo "    Kibana Stack:     ${KBNSTACK_PID:-(not started)}"
+[ -n "$SLS_CHROME_PID" ]   && echo "    Chrome SLS:       $SLS_CHROME_PID"
+[ -n "$STACK_CHROME_PID" ] && echo "    Chrome Stack:     $STACK_CHROME_PID"
+echo ""
+echo "  Logs: $LOG_DIR"
+if [ "$SHOW_LOGS" = true ]; then
+  echo "  View: tmux attach -t kbn-logs"
+else
+  echo "  View: tail -f $LOG_DIR/*.log"
+fi
+echo ""
+echo "============================================="
+echo "Press Ctrl+C to stop all processes."
+
+wait
