@@ -109,22 +109,25 @@ case ":$PATH:" in
 esac
 
 if [ "$path_ok" = false ]; then
-  echo ""
-  echo "  $INSTALL_DIR is not in your PATH."
-
   shell_rc=""
   case "${SHELL:-}" in
     */zsh)  shell_rc="$HOME/.zshrc" ;;
     */bash) shell_rc="$HOME/.bashrc" ;;
   esac
 
-  if [ -n "$shell_rc" ]; then
+  if [ -n "$shell_rc" ] && grep -qF "$INSTALL_DIR" "$shell_rc" 2>/dev/null; then
+    echo "  [OK] PATH entry already in $shell_rc (source it to activate)"
+  elif [ -n "$shell_rc" ]; then
+    echo ""
+    echo "  $INSTALL_DIR is not in your PATH."
     echo "  Adding to $shell_rc..."
     echo "" >> "$shell_rc"
     echo "# kbn-dev-tools" >> "$shell_rc"
     echo "export PATH=\"$INSTALL_DIR:\$PATH\"" >> "$shell_rc"
     echo "  Done. Run: source $shell_rc"
   else
+    echo ""
+    echo "  $INSTALL_DIR is not in your PATH."
     echo "  Add this to your shell profile:"
     echo "    export PATH=\"$INSTALL_DIR:\$PATH\""
   fi
