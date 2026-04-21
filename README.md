@@ -13,15 +13,15 @@ cd kbn-dev-tools
 ```
 
 This installs:
+
 - `kbn-dev` and `kbn-dev-ctl` to `~/.local/bin/`
 - Claude Code agent skills to `~/.claude/skills/` and `~/.agents/skills/`
-- Scripts + skills into your kibana repo (if found)
 
 ## Prerequisites
 
 - **Node version manager** — any of: [nvm](https://github.com/nvm-sh/nvm), [fnm](https://github.com/Schniz/fnm), [volta](https://volta.sh), [mise](https://mise.jdx.dev), or [asdf](https://asdf-vm.com)
 - **Docker** — required for ES clusters
-- **Kibana repo** — a local checkout (the scripts run from its root)
+- **Kibana repo** — a local checkout; run all commands from its root
 - **Chrome** — auto-detected, or set `CHROME_BIN` (optional)
 
 ## Usage
@@ -46,19 +46,12 @@ kbn-dev-ctl stop         # stop everything
 ## What it starts
 
 | Component     | Port | Description                     |
-|---------------|------|---------------------------------|
+| ------------- | ---- | ------------------------------- |
 | ES Serverless | 9200 | Docker-based serverless cluster |
 | ES Stateful   | 9201 | Snapshot-based trial cluster    |
 | Optimizer     | —    | Shared plugin builder (watch)   |
 | Kibana SLS    | 5601 | Serverless Kibana               |
 | Kibana Stack  | 5611 | Stateful Kibana                 |
-
-## Login
-
-| Instance   | URL                      | Credentials                |
-|------------|--------------------------|----------------------------|
-| Serverless | http://localhost:5601    | Select "admin" role (mock) |
-| Stateful   | http://localhost:5611    | elastic / changeme         |
 
 ## Claude Code / Cursor integration
 
@@ -73,7 +66,7 @@ authentication screens in browser automation, and diagnose failures.
 ## Environment variables
 
 | Variable                 | Default                                                | Purpose                       |
-|--------------------------|--------------------------------------------------------|-------------------------------|
+| ------------------------ | ------------------------------------------------------ | ----------------------------- |
 | `KBN_INFERENCE_URL`      | `https://inference.eu-west-1.aws.svc.qa.elastic.cloud` | EIS URL. Set `""` to disable. |
 | `KIBANA_EIS_CCM_API_KEY` | (none)                                                 | Skip vault, use key directly. |
 | `CHROME_BIN`             | auto-detected                                          | Path to Chrome binary.        |

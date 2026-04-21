@@ -12,13 +12,12 @@
 #
 # What it does:
 #   1. Copies kbn-dev and kbn-dev-ctl to ~/.local/bin/ (added to PATH)
-#   2. Installs Claude Code agent skills via `npx @anthropic-ai/claude-code skill install`
-#   3. Verifies prerequisites (nvm, Docker, kibana repo)
+#   2. Installs Claude Code agent skills to ~/.claude/skills/ and ~/.agents/skills/
+#   3. Verifies prerequisites (nvm, Docker)
 #
 # Prerequisites:
 #   - A node version manager (nvm, fnm, volta, mise, or asdf)
 #   - Docker
-#   - A local kibana repo checkout
 #   - Claude Code CLI (for skill install; optional)
 # ---------------------------------------------------------------------------
 
@@ -82,22 +81,6 @@ if command -v docker >/dev/null 2>&1; then
 else
   echo "  [!!] Docker not found. Required for ES clusters."
   check_ok=false
-fi
-
-# Try to find the kibana repo
-KBN_REPO=""
-for candidate in ~/workplace/kibana ~/kibana ~/dev/kibana; do
-  if [ -f "$candidate/package.json" ] && grep -q '"name": "kibana"' "$candidate/package.json" 2>/dev/null; then
-    KBN_REPO="$candidate"
-    break
-  fi
-done
-
-if [ -n "$KBN_REPO" ]; then
-  echo "  [OK] Kibana repo found at $KBN_REPO"
-else
-  echo "  [!!] Kibana repo not found. Checked ~/workplace/kibana, ~/kibana, ~/dev/kibana"
-  echo "       You'll need to cd to your kibana repo before running kbn-dev."
 fi
 
 if [ "$check_ok" = false ]; then
@@ -191,44 +174,6 @@ fi
 
 echo ""
 
-# --- Also install into kibana repo if found -------------------------------
-if [ -n "$KBN_REPO" ]; then
-  echo "Setting up kibana repo integration..."
-
-  # Register as yarn scripts in package.json if not already present
-  if ! grep -q '"kbn-dev"' "$KBN_REPO/package.json" 2>/dev/null; then
-    echo "  NOTE: Add these to your kibana package.json scripts:"
-    echo '    "kbn-dev": "bash scripts/kbn_dev.sh",'
-    echo '    "kbn-dev-ctl": "bash scripts/kbn_dev_ctl.sh",'
-  else
-    echo "  [OK] yarn scripts already registered in package.json"
-  fi
-
-  # Copy scripts to kibana repo's scripts/ directory
-  KBN_SCRIPTS="$KBN_REPO/scripts"
-  if [ -d "$KBN_SCRIPTS" ]; then
-    cp "$SCRIPTS_SRC/kbn_dev.sh" "$KBN_SCRIPTS/kbn_dev.sh"
-    cp "$SCRIPTS_SRC/kbn_dev_ctl.sh" "$KBN_SCRIPTS/kbn_dev_ctl.sh"
-    chmod +x "$KBN_SCRIPTS/kbn_dev.sh" "$KBN_SCRIPTS/kbn_dev_ctl.sh"
-    echo "  Copied scripts to $KBN_SCRIPTS/"
-  fi
-
-  # Install skills into kibana's .agents/skills/
-  KBN_AGENTS="$KBN_REPO/.agents/skills"
-  if [ -d "$KBN_AGENTS" ] || [ -d "$KBN_REPO/.agents" ]; then
-    mkdir -p "$KBN_AGENTS"
-    for skill_dir in "$SKILLS_SRC"/*/; do
-      skill_name="$(basename "$skill_dir")"
-      dest="$KBN_AGENTS/$skill_name"
-      [ -d "$dest" ] && rm -rf "$dest"
-      cp -r "$skill_dir" "$dest"
-    done
-    echo "  Installed skills to $KBN_AGENTS/"
-  fi
-
-  echo ""
-fi
-
 # --- Done -----------------------------------------------------------------
 echo "======================================"
 echo " Installation complete!"
@@ -238,8 +183,8 @@ echo "  Commands:"
 echo "    kbn-dev            Start Kibana (serverless + stateful)"
 echo "    kbn-dev-ctl        Control plane (status, logs, restart, stop)"
 echo ""
-echo "  Usage (from kibana repo root):"
-echo "    cd $KBN_REPO"
+echo "  Usage (from your kibana repo root):"
+echo "    cd <your-kibana-repo>"
 echo "    kbn-dev --quiet       # start in background"
 echo "    kbn-dev-ctl status    # check health"
 echo "    kbn-dev-ctl attach    # open tmux log viewer"
