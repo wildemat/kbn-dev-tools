@@ -19,8 +19,8 @@ This installs:
 
 ## Prerequisites
 
-- **Node version manager** — any of: [nvm](https://github.com/nvm-sh/nvm), [fnm](https://github.com/Schniz/fnm), [volta](https://volta.sh), [mise](https://mise.jdx.dev), or [asdf](https://asdf-vm.com)
 - **Docker** — required for ES clusters
+- **Node version manager** *(optional)* — any of: [nvm](https://github.com/nvm-sh/nvm), [fnm](https://github.com/Schniz/fnm), [volta](https://volta.sh), [mise](https://mise.jdx.dev), or [asdf](https://asdf-vm.com). If detected, kbn-dev will auto-switch to kibana's required Node version. Without one, you must ensure the correct Node version is active yourself.
 - **Kibana repo** — a local checkout; run all commands from its root
 - **Chrome** — auto-detected, or set `CHROME_BIN` (optional)
 

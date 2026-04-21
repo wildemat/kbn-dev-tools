@@ -13,12 +13,13 @@
 # What it does:
 #   1. Copies kbn-dev and kbn-dev-ctl to ~/.local/bin/ (added to PATH)
 #   2. Installs Claude Code agent skills to ~/.claude/skills/ and ~/.agents/skills/
-#   3. Verifies prerequisites (nvm, Docker)
+#   3. Verifies prerequisites (Docker; optionally a node version manager)
 #
 # Prerequisites:
-#   - A node version manager (nvm, fnm, volta, mise, or asdf)
 #   - Docker
-#   - Claude Code CLI (for skill install; optional)
+#   - A node version manager (optional: nvm, fnm, volta, mise, or asdf)
+#     If detected, kbn-dev will auto-switch to kibana's required Node version.
+#     Without one, you must ensure the correct Node version is active yourself.
 # ---------------------------------------------------------------------------
 
 set -euo pipefail
@@ -69,11 +70,11 @@ elif [ -s "${ASDF_DIR:-$HOME/.asdf}/asdf.sh" ]; then
 fi
 
 if [ -n "$node_mgr" ]; then
-  echo "  [OK] Node version manager: $node_mgr"
+  echo "  [OK] Node version manager: $node_mgr (will auto-switch to kibana's Node version)"
 else
-  echo "  [!!] No node version manager found (checked nvm, fnm, volta, mise, asdf)."
-  echo "       Install one: https://github.com/nvm-sh/nvm or https://github.com/Schniz/fnm"
-  check_ok=false
+  echo "  [--] No node version manager found (checked nvm, fnm, volta, mise, asdf)."
+  echo "       Not required, but you'll need to ensure the correct Node version is active."
+  echo "       To enable auto-switching: https://github.com/nvm-sh/nvm or https://github.com/Schniz/fnm"
 fi
 
 if command -v docker >/dev/null 2>&1; then
