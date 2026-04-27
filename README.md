@@ -2,7 +2,7 @@
 
 One-command installer for the Kibana dual-mode dev environment. Spins up
 **serverless** (`:5601`) and **stateful** (`:5611`) Kibana instances in
-parallel with shared ES clusters and optimizer.
+parallel with shared optimizer and EIS via cloud connected mode.
 
 ## Quick install
 
