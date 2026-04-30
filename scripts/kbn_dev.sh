@@ -679,6 +679,10 @@ if command -v docker >/dev/null 2>&1; then
 
   # Remove stale 'elastic' Docker network — stale DNS entries from crashed
   # containers can cause uiam to fail resolving uiam-cosmosdb.
+  # Force-disconnect any lingering containers first, otherwise rm fails.
+  for cid in $(docker network inspect elastic -f '{{range .Containers}}{{.Name}} {{end}}' 2>/dev/null); do
+    docker network disconnect -f elastic "$cid" 2>/dev/null || true
+  done
   docker network rm elastic 2>/dev/null || true
 
   if [ "$CLEAN_CACHE" = true ]; then
