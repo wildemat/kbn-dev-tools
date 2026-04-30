@@ -217,3 +217,9 @@ echo "  Claude Code skills:"
 echo "    /kbn-dev              # start/stop/restart"
 echo "    /kbn-dev-status       # quick status check"
 echo ""
+if [ -n "$shell_rc" ]; then
+  echo "  >>> Run this to make sure the correct environment variables are used:"
+  echo ""
+  echo "      source $shell_rc"
+  echo ""
+fi
