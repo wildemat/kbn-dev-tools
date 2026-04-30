@@ -6,16 +6,15 @@
 #   yarn kbn-dev
 #
 # Configuration:
-#   Copy .env.dev to .env in the kbn-dev-tools repo root and override as needed:
-#     cp <kbn-dev-tools>/.env.dev <kbn-dev-tools>/.env
-#   The .env file is gitignored and sourced automatically on startup via
-#   the KBN_DEV_ENV_FILE env var (set by the installer in your shell profile).
+#   The installer creates a .env file in the kbn-dev-tools repo root.
+#   Edit it to override defaults. It is gitignored and sourced automatically
+#   on startup via KBN_DEV_ENV_FILE (set by the installer in your shell profile).
 #   See .env.dev for all available variables with descriptions.
 #
 # Environment variables (can also be set in .env):
 #   CHROME_BIN                   Path to Chrome. Auto-detected if not set.
 #   SKIP_BROWSER_LAUNCH          Set to any value to skip Chrome launch.
-#   KBN_DEV_LOG_DIR              Log directory. Default: ~/.kbn/logs
+#   KBN_DEV_LOG_DIR              Log directory. Default: ~/.kbn-dev/logs
 #   KBN_DEV_INFERENCE_URL        EIS URL. Set to "" to disable.
 #                                Default: "https://inference.eu-west-1.aws.svc.qa.elastic.cloud"
 #   KIBANA_EIS_CCM_API_KEY       EIS API key (skips vault). For CI.
@@ -190,7 +189,7 @@ if [ "$INTERACTIVE" = true ]; then
               or KBN_DEV_INFERENCE_URL="")
 
  Configuration:
-   Copy .env.dev to .env in the kbn-dev-tools directory to customize.
+   Edit .env in the kbn-dev-tools directory to customize.
    See .env.dev for all KBN_DEV_* variables with descriptions.
 
  Flags:
@@ -286,7 +285,7 @@ done
 
 # --- Chrome profile setup --------------------------------------------------
 LAUNCH_BROWSER=true
-CHROME_PROFILE_DIR="$HOME/.kbn-chrome"
+CHROME_PROFILE_DIR="$HOME/.kbn-dev/chrome"
 SLS_PROFILE="$CHROME_PROFILE_DIR/kbn-sls"
 STACK_PROFILE="$CHROME_PROFILE_DIR/kbn-stack"
 
@@ -388,8 +387,18 @@ open_chrome() {
 }
 
 # --- Logging ----------------------------------------------------------------
-LOG_DIR="${KBN_DEV_LOG_DIR:-$HOME/.kbn/logs}"
+LOG_DIR="${KBN_DEV_LOG_DIR:-$HOME/.kbn-dev/logs}"
 mkdir -p "$LOG_DIR"
+if [ ! -f "$LOG_DIR/../README" ]; then
+  cat > "$LOG_DIR/../README" <<'EOF'
+This directory is managed by kbn-dev (https://github.com/wildemat/kbn-dev-tools).
+
+  logs/       Runtime logs for ES and Kibana instances
+  chrome/     Chrome profile data for isolated Kibana browser sessions
+
+Safe to delete when kbn-dev is not running.
+EOF
+fi
 
 # --- Kill previous instance -------------------------------------------------
 PIDFILE="$LOG_DIR/kbn.pid"

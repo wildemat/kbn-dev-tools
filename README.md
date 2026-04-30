@@ -65,13 +65,7 @@ authentication screens in browser automation, and diagnose failures.
 
 ## Configuration
 
-Copy `.env.dev` to `.env` and uncomment/edit any values you want to override:
-
-```bash
-cp .env.dev .env
-```
-
-The `.env` file is gitignored and sourced automatically by `kbn-dev` on startup. See `.env.dev` for all available variables with inline documentation.
+The installer creates a `.env` file in the kbn-dev-tools directory. Edit it to override defaults — it's gitignored and sourced automatically by `kbn-dev` on startup. See `.env.dev` for all available variables with inline documentation.
 
 ## Environment variables
 
@@ -80,7 +74,7 @@ All kbn-dev-specific variables use the `KBN_DEV_` prefix to avoid collisions wit
 | Variable                        | Default                                                | Purpose                                   |
 | ------------------------------- | ------------------------------------------------------ | ----------------------------------------- |
 | `KBN_DEV_INFERENCE_URL`         | `https://inference.eu-west-1.aws.svc.qa.elastic.cloud` | EIS URL. Set `""` to disable.             |
-| `KBN_DEV_LOG_DIR`               | `~/.kbn/logs`                                          | Log file directory.                       |
+| `KBN_DEV_LOG_DIR`               | `~/.kbn-dev/logs`                                      | Log file directory.                       |
 | `KBN_DEV_ES_SLS_PROJECT_TYPE`   | `elasticsearch_general_purpose`                        | Serverless ES project type.               |
 | `KBN_DEV_ES_STACK_LICENSE`      | `trial`                                                | Stateful ES license (`basic` or `trial`). |
 | `KBN_DEV_ES_STACK_ML_ENABLED`   | `false`                                                | Enable ML on stateful ES (memory-heavy).  |
@@ -95,8 +89,8 @@ All kbn-dev-specific variables use the `KBN_DEV_` prefix to avoid collisions wit
 kbn-dev-tools/
 ├── install.sh              # One-step installer
 ├── README.md
-├── .env.dev                # Default env vars (copy to .env to customize)
-├── .env                    # Your local overrides (gitignored)
+├── .env.dev                # Default env var template
+├── .env                    # Your local overrides (created by installer, gitignored)
 ├── scripts/
 │   ├── kbn_dev.sh          # Orchestrator (starts everything)
 │   └── kbn_dev_ctl.sh      # Control plane (status/logs/restart/stop)

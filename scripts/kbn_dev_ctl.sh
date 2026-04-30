@@ -13,7 +13,7 @@
 #
 # Components: essls, esstack, optimizer, kbnsls, kbnstack, all
 #
-# The log directory defaults to ~/.kbn/logs (override with KBN_LOG_DIR).
+# The log directory defaults to ~/.kbn-dev/logs (override with KBN_DEV_LOG_DIR).
 # All commands work from any directory.
 # ---------------------------------------------------------------------------
 
@@ -70,7 +70,7 @@ setup_node
 
 # --- Locate log directory ---------------------------------------------------
 find_log_dir() {
-  local d="${KBN_LOG_DIR:-$HOME/.kbn/logs}"
+  local d="${KBN_DEV_LOG_DIR:-$HOME/.kbn-dev/logs}"
   mkdir -p "$d" 2>/dev/null
   echo "$d"
 }

@@ -103,6 +103,12 @@ chmod +x "$INSTALL_DIR/kbn-dev" "$INSTALL_DIR/kbn-dev-ctl"
 echo "  Installed: $INSTALL_DIR/kbn-dev"
 echo "  Installed: $INSTALL_DIR/kbn-dev-ctl"
 
+# --- Create .env from template if it doesn't exist ------------------------
+if [ -f "$KBN_DEV_SCRIPT_DIR/.env.dev" ] && [ ! -f "$KBN_DEV_SCRIPT_DIR/.env" ]; then
+  cp "$KBN_DEV_SCRIPT_DIR/.env.dev" "$KBN_DEV_SCRIPT_DIR/.env"
+  echo "  Created:   .env (from .env.dev — edit to customize)"
+fi
+
 # --- Ensure PATH includes install dir -------------------------------------
 path_ok=false
 case ":$PATH:" in
@@ -205,8 +211,7 @@ echo "    kbn-dev-ctl status    # check health"
 echo "    kbn-dev-ctl attach    # open tmux log viewer"
 echo ""
 echo "  Configuration:"
-echo "    cp .env.dev .env    # (in this directory)"
-echo "    # Edit .env to override defaults (ES project type, license, ML, etc.)"
+echo "    Edit .env in this directory to override defaults."
 echo ""
 echo "  Claude Code skills:"
 echo "    /kbn-dev              # start/stop/restart"
