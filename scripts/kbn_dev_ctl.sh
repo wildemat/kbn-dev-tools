@@ -19,6 +19,15 @@
 
 set -euo pipefail
 
+# --- Source .env overrides --------------------------------------------------
+if [ -z "${KBN_DEV_ENV_FILE:-}" ]; then
+  KBN_DEV_ENV_FILE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/.env"
+fi
+if [ -f "$KBN_DEV_ENV_FILE" ]; then
+  # shellcheck disable=SC1090
+  set -a; . "$KBN_DEV_ENV_FILE"; set +a
+fi
+
 # --- Node version setup -----------------------------------------------------
 # Agent shells (Claude Code, Cursor, CI) don't load version managers by
 # default, so yarn may see the wrong node and fail the engine check.
