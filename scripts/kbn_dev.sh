@@ -5,21 +5,24 @@
 # Run from the ROOT of your kibana repo checkout:
 #   yarn kbn-dev
 #
-# Optional environment variables:
-#   CHROME_BIN            Path to Google Chrome executable. Auto-detected if
-#                         not set (checks standard macOS/Linux locations).
-#                         Override: export CHROME_BIN="/path/to/google-chrome"
-#   KBN_LOG_DIR           Directory for log files.
-#                         Default: ~/.kbn/logs
-#   KBN_INFERENCE_URL     Elastic inference service URL.
-#                         Default: "https://inference.eu-west-1.aws.svc.qa.elastic.cloud"
-#                         Set to "" to disable EIS entirely.
-#                         When enabled, vault access is verified upfront and
-#                         'node scripts/eis.js' runs after each ES cluster is ready.
-#   KIBANA_EIS_CCM_API_KEY  If set, this API key is used directly and vault is
-#                         skipped. Useful for CI or when vault is unavailable.
-#   SKIP_BROWSER_LAUNCH   Set to any value to skip Chrome profile setup and
-#                         browser launch entirely.
+# Configuration:
+#   Copy .env.dev to .env in the kbn-dev-tools repo root and override as needed:
+#     cp <kbn-dev-tools>/.env.dev <kbn-dev-tools>/.env
+#   The .env file is gitignored and sourced automatically on startup via
+#   the KBN_DEV_ENV_FILE env var (set by the installer in your shell profile).
+#   See .env.dev for all available variables with descriptions.
+#
+# Environment variables (can also be set in .env):
+#   CHROME_BIN                   Path to Chrome. Auto-detected if not set.
+#   SKIP_BROWSER_LAUNCH          Set to any value to skip Chrome launch.
+#   KBN_DEV_LOG_DIR              Log directory. Default: ~/.kbn/logs
+#   KBN_DEV_INFERENCE_URL        EIS URL. Set to "" to disable.
+#                                Default: "https://inference.eu-west-1.aws.svc.qa.elastic.cloud"
+#   KIBANA_EIS_CCM_API_KEY       EIS API key (skips vault). For CI.
+#   KBN_DEV_ES_SLS_PROJECT_TYPE  Serverless project type. Default: elasticsearch_general_purpose
+#   KBN_DEV_ES_STACK_LICENSE     Stateful ES license. Default: trial
+#   KBN_DEV_ES_STACK_ML_ENABLED  Enable ML on stateful ES. Default: false
+#   KBN_DEV_ES_STACK_EXTRA_ARGS  Additional -E args for stateful ES.
 #
 # Flags:
 #   --clean               Wipe .es/cache and run `yarn kbn clean` before boot.
@@ -31,7 +34,7 @@
 #   - Docker running (required by `yarn es`)
 #   - Google Chrome (auto-detected, or set CHROME_BIN)
 #   - Ports 5601, 5611, 9200, 9201, 9300, 9301 must be free
-#   - vault CLI (for EIS; skip with KIBANA_EIS_CCM_API_KEY or KBN_INFERENCE_URL="")
+#   - vault CLI (for EIS; skip with KIBANA_EIS_CCM_API_KEY or KBN_DEV_INFERENCE_URL="")
 # ---------------------------------------------------------------------------
 
 # --- Detect interactive mode ------------------------------------------------
@@ -40,6 +43,17 @@
 INTERACTIVE=true
 [ -t 0 ] || INTERACTIVE=false
 SHUTTING_DOWN=false
+
+# --- Source .env overrides --------------------------------------------------
+# KBN_DEV_ENV_FILE is set by the installer (in shell profile).
+# Falls back to .env next to this script (for running directly from the repo).
+if [ -z "${KBN_DEV_ENV_FILE:-}" ]; then
+  KBN_DEV_ENV_FILE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/.env"
+fi
+if [ -f "$KBN_DEV_ENV_FILE" ]; then
+  # shellcheck disable=SC1090
+  set -a; . "$KBN_DEV_ENV_FILE"; set +a
+fi
 
 # =============================================================================
 # Utility functions
@@ -173,14 +187,11 @@ if [ "$INTERACTIVE" = true ]; then
    Docker     required by 'yarn es' for ES clusters
    Chrome     auto-detected, or set CHROME_BIN
    vault      required for EIS (skip with KIBANA_EIS_CCM_API_KEY
-              or KBN_INFERENCE_URL="")
+              or KBN_DEV_INFERENCE_URL="")
 
- Environment variables:
-   KBN_INFERENCE_URL        EIS inference service URL
-   KIBANA_EIS_CCM_API_KEY   Provide EIS API key directly (skips vault)
-   CHROME_BIN               Path to Chrome binary (auto-detected if unset)
-   KBN_LOG_DIR              Log directory. Default: ~/.kbn/logs
-   SKIP_BROWSER_LAUNCH      Set to any value to skip Chrome launch
+ Configuration:
+   Copy .env.dev to .env in the kbn-dev-tools directory to customize.
+   See .env.dev for all KBN_DEV_* variables with descriptions.
 
  Flags:
    --clean                  Wipe .es/cache and run 'yarn kbn clean'
@@ -377,7 +388,7 @@ open_chrome() {
 }
 
 # --- Logging ----------------------------------------------------------------
-LOG_DIR="${KBN_LOG_DIR:-$HOME/.kbn/logs}"
+LOG_DIR="${KBN_DEV_LOG_DIR:-$HOME/.kbn/logs}"
 mkdir -p "$LOG_DIR"
 
 # --- Kill previous instance -------------------------------------------------
@@ -496,11 +507,17 @@ for f in "$ESSLS_LOG" "$ESSTACK_LOG" "$KBNSLS_LOG" "$KBNSTACK_LOG" "$OPTIMIZER_L
 done
 
 # --- Build inference flag ---------------------------------------------------
-KBN_INFERENCE_URL="${KBN_INFERENCE_URL:-https://inference.eu-west-1.aws.svc.qa.elastic.cloud}"
+KBN_DEV_INFERENCE_URL="${KBN_DEV_INFERENCE_URL:-https://inference.eu-west-1.aws.svc.qa.elastic.cloud}"
 INFERENCE_FLAG=""
-if [ -n "$KBN_INFERENCE_URL" ]; then
-  INFERENCE_FLAG="-E xpack.inference.elastic.url=$KBN_INFERENCE_URL"
+if [ -n "$KBN_DEV_INFERENCE_URL" ]; then
+  INFERENCE_FLAG="-E xpack.inference.elastic.url=$KBN_DEV_INFERENCE_URL"
 fi
+
+# --- ES cluster overrides ---------------------------------------------------
+KBN_DEV_ES_SLS_PROJECT_TYPE="${KBN_DEV_ES_SLS_PROJECT_TYPE:-elasticsearch_general_purpose}"
+KBN_DEV_ES_STACK_LICENSE="${KBN_DEV_ES_STACK_LICENSE:-trial}"
+KBN_DEV_ES_STACK_ML_ENABLED="${KBN_DEV_ES_STACK_ML_ENABLED:-false}"
+KBN_DEV_ES_STACK_EXTRA_ARGS="${KBN_DEV_ES_STACK_EXTRA_ARGS:-}"
 
 # --- Vault pre-check for EIS -----------------------------------------------
 EIS_VAULT_ADDR="${VAULT_ADDR:-https://secrets.elastic.co:8200}"
@@ -521,14 +538,14 @@ setup_eis_vault() {
   echo " EIS — Cloud Connected Mode"
   echo "============================================="
   echo ""
-  echo "  URL:     $KBN_INFERENCE_URL"
+  echo "  URL:     $KBN_DEV_INFERENCE_URL"
   echo "  Vault:   $EIS_VAULT_ADDR"
   echo "  Secret:  $EIS_VAULT_SECRET"
   echo ""
 
   if ! command -v vault >/dev/null 2>&1; then
     echo "  ERROR: 'vault' CLI not found."
-    echo "  To fix: install vault, set KIBANA_EIS_CCM_API_KEY, or set KBN_INFERENCE_URL=\"\""
+    echo "  To fix: install vault, set KIBANA_EIS_CCM_API_KEY, or set KBN_DEV_INFERENCE_URL=\"\""
     echo "  Continuing without EIS."
     INFERENCE_FLAG=""
     return
@@ -585,14 +602,16 @@ echo " kbn-dev: Kibana dual-mode dev launcher"
 echo "============================================="
 echo "  Repo:      $KBN_DIR"
 echo "  Clean:     $CLEAN_CACHE"
-echo "  EIS:       $([ -n "$INFERENCE_FLAG" ] && echo "enabled ($KBN_INFERENCE_URL)" || echo "disabled")"
+echo "  EIS:       $([ -n "$INFERENCE_FLAG" ] && echo "enabled ($KBN_DEV_INFERENCE_URL)" || echo "disabled")"
+echo "  ES SLS:    projectType=$KBN_DEV_ES_SLS_PROJECT_TYPE"
+echo "  ES Stack:  license=$KBN_DEV_ES_STACK_LICENSE, ml=$KBN_DEV_ES_STACK_ML_ENABLED"
 echo "  Browser:   $([ "$LAUNCH_BROWSER" = true ] && echo "Chrome (kbn-sls + kbn-stack profiles)" || echo "disabled")"
 echo "  Show logs: $SHOW_LOGS"
 echo "============================================="
 echo ""
 echo " LOGGING"
 echo "  Dir: $LOG_DIR"
-echo "  Override with: KBN_LOG_DIR=/your/path"
+echo "  Override with: KBN_DEV_LOG_DIR=/your/path"
 if [ "$SHOW_LOGS" = true ]; then
   if command -v tmux >/dev/null 2>&1; then
     echo "  Tmux log viewer will open automatically (--quiet to disable)."
@@ -689,7 +708,7 @@ log_step "Starting ES Serverless..." "$ESSLS_LOG"
 
     # shellcheck disable=SC2086
     yarn es serverless \
-      --projectType elasticsearch_general_purpose \
+      --projectType "$KBN_DEV_ES_SLS_PROJECT_TYPE" \
       --clean --kill \
       $INFERENCE_FLAG \
     && break
@@ -705,10 +724,11 @@ log_step "Starting ES Stateful (snapshot)..." "$ESSTACK_LOG"
   cd "$KBN_DIR" || exit 1
   # shellcheck disable=SC2086
   yarn es snapshot \
-    --license trial --clean \
+    --license "$KBN_DEV_ES_STACK_LICENSE" --clean \
     -E http.port=9201 \
     -E transport.port=9301 \
-    -E xpack.ml.enabled=false \
+    -E xpack.ml.enabled="$KBN_DEV_ES_STACK_ML_ENABLED" \
+    $KBN_DEV_ES_STACK_EXTRA_ARGS \
     $INFERENCE_FLAG
 ) >> "$ESSTACK_LOG" 2>&1 &
 ESSTACK_PID=$!

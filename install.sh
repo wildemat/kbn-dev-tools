@@ -25,7 +25,7 @@
 set -euo pipefail
 
 INSTALL_DIR="${KBN_DEV_TOOLS_DIR:-$HOME/.local/bin}"
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+KBN_DEV_SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 echo ""
 echo "======================================"
@@ -35,10 +35,10 @@ echo ""
 
 # --- Locate source scripts ------------------------------------------------
 find_scripts() {
-  if [ -f "$SCRIPT_DIR/scripts/kbn_dev.sh" ]; then
-    echo "$SCRIPT_DIR/scripts"
-  elif [ -f "$SCRIPT_DIR/kbn_dev.sh" ]; then
-    echo "$SCRIPT_DIR"
+  if [ -f "$KBN_DEV_SCRIPT_DIR/scripts/kbn_dev.sh" ]; then
+    echo "$KBN_DEV_SCRIPT_DIR/scripts"
+  elif [ -f "$KBN_DEV_SCRIPT_DIR/kbn_dev.sh" ]; then
+    echo "$KBN_DEV_SCRIPT_DIR"
   else
     echo ""
   fi
@@ -109,28 +109,37 @@ case ":$PATH:" in
   *":$INSTALL_DIR:"*) path_ok=true ;;
 esac
 
-if [ "$path_ok" = false ]; then
-  shell_rc=""
-  case "${SHELL:-}" in
-    */zsh)  shell_rc="$HOME/.zshrc" ;;
-    */bash) shell_rc="$HOME/.bashrc" ;;
-  esac
+KBN_DEV_TOOLS_ROOT="$(cd "$KBN_DEV_SCRIPT_DIR" && pwd)"
+ENV_FILE_PATH="$KBN_DEV_TOOLS_ROOT/.env"
 
-  if [ -n "$shell_rc" ] && grep -qF "$INSTALL_DIR" "$shell_rc" 2>/dev/null; then
-    echo "  [OK] PATH entry already in $shell_rc (source it to activate)"
-  elif [ -n "$shell_rc" ]; then
+shell_rc=""
+case "${SHELL:-}" in
+  */zsh)  shell_rc="$HOME/.zshrc" ;;
+  */bash) shell_rc="$HOME/.bashrc" ;;
+esac
+
+if [ "$path_ok" = false ]; then
+  if [ -n "$shell_rc" ]; then
     echo ""
     echo "  $INSTALL_DIR is not in your PATH."
     echo "  Adding to $shell_rc..."
     echo "" >> "$shell_rc"
     echo "# kbn-dev-tools" >> "$shell_rc"
     echo "export PATH=\"$INSTALL_DIR:\$PATH\"" >> "$shell_rc"
+    echo "export KBN_DEV_ENV_FILE=\"$ENV_FILE_PATH\"" >> "$shell_rc"
     echo "  Done. Run: source $shell_rc"
   else
     echo ""
     echo "  $INSTALL_DIR is not in your PATH."
     echo "  Add this to your shell profile:"
     echo "    export PATH=\"$INSTALL_DIR:\$PATH\""
+    echo "    export KBN_DEV_ENV_FILE=\"$ENV_FILE_PATH\""
+  fi
+else
+  # PATH is fine, but ensure KBN_DEV_ENV_FILE is exported
+  if [ -n "$shell_rc" ] && ! grep -qF "KBN_DEV_ENV_FILE" "$shell_rc" 2>/dev/null; then
+    echo "export KBN_DEV_ENV_FILE=\"$ENV_FILE_PATH\"" >> "$shell_rc"
+    echo "  Added KBN_DEV_ENV_FILE to $shell_rc. Run: source $shell_rc"
   fi
 fi
 
@@ -139,7 +148,7 @@ echo ""
 # --- Install Claude Code skills -------------------------------------------
 echo "Installing Claude Code agent skills..."
 
-SKILLS_SRC="$SCRIPT_DIR/skills"
+SKILLS_SRC="$KBN_DEV_SCRIPT_DIR/skills"
 if [ ! -d "$SKILLS_SRC/kbn-dev" ]; then
   echo "  Skills directory not found at $SKILLS_SRC. Skipping."
 else
@@ -178,6 +187,8 @@ fi
 
 echo ""
 
+echo ""
+
 # --- Done -----------------------------------------------------------------
 echo "======================================"
 echo " Installation complete!"
@@ -192,6 +203,10 @@ echo "    cd <your-kibana-repo>"
 echo "    kbn-dev --quiet       # start in background"
 echo "    kbn-dev-ctl status    # check health"
 echo "    kbn-dev-ctl attach    # open tmux log viewer"
+echo ""
+echo "  Configuration:"
+echo "    cp .env.dev .env    # (in this directory)"
+echo "    # Edit .env to override defaults (ES project type, license, ML, etc.)"
 echo ""
 echo "  Claude Code skills:"
 echo "    /kbn-dev              # start/stop/restart"
