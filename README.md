@@ -76,9 +76,10 @@ All kbn-dev-specific variables use the `KBN_DEV_` prefix to avoid collisions wit
 | `KBN_DEV_INFERENCE_URL`         | `https://inference.eu-west-1.aws.svc.qa.elastic.cloud` | EIS URL. Set `""` to disable.             |
 | `KBN_DEV_LOG_DIR`               | `~/.kbn-dev/logs`                                      | Log file directory.                       |
 | `KBN_DEV_ES_SLS_PROJECT_TYPE`   | `elasticsearch_general_purpose`                        | Serverless ES project type.               |
+| `KBN_DEV_ES_SLS_EXTRA_ARGS`    | (none)                                                 | Additional args for serverless ES.        |
 | `KBN_DEV_ES_STACK_LICENSE`      | `trial`                                                | Stateful ES license (`basic` or `trial`). |
 | `KBN_DEV_ES_STACK_ML_ENABLED`   | `false`                                                | Enable ML on stateful ES (memory-heavy).  |
-| `KBN_DEV_ES_STACK_EXTRA_ARGS`   | (none)                                                 | Additional `-E` args for stateful ES.     |
+| `KBN_DEV_ES_STACK_EXTRA_ARGS`   | (none)                                                 | Additional args for stateful ES.          |
 | `KIBANA_EIS_CCM_API_KEY`        | (none)                                                 | Skip vault, use EIS key directly.         |
 | `CHROME_BIN`                    | auto-detected                                          | Path to Chrome binary.                    |
 | `SKIP_BROWSER_LAUNCH`           | (unset)                                                | Set to skip Chrome launch.                |

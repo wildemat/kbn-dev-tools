@@ -19,9 +19,10 @@
 #                                Default: "https://inference.eu-west-1.aws.svc.qa.elastic.cloud"
 #   KIBANA_EIS_CCM_API_KEY       EIS API key (skips vault). For CI.
 #   KBN_DEV_ES_SLS_PROJECT_TYPE  Serverless project type. Default: elasticsearch_general_purpose
+#   KBN_DEV_ES_SLS_EXTRA_ARGS   Additional args for serverless ES.
 #   KBN_DEV_ES_STACK_LICENSE     Stateful ES license. Default: trial
 #   KBN_DEV_ES_STACK_ML_ENABLED  Enable ML on stateful ES. Default: false
-#   KBN_DEV_ES_STACK_EXTRA_ARGS  Additional -E args for stateful ES.
+#   KBN_DEV_ES_STACK_EXTRA_ARGS  Additional args for stateful ES.
 #
 # Flags:
 #   --clean               Wipe .es/cache and run `yarn kbn clean` before boot.
@@ -524,6 +525,7 @@ fi
 
 # --- ES cluster overrides ---------------------------------------------------
 KBN_DEV_ES_SLS_PROJECT_TYPE="${KBN_DEV_ES_SLS_PROJECT_TYPE:-elasticsearch_general_purpose}"
+KBN_DEV_ES_SLS_EXTRA_ARGS="${KBN_DEV_ES_SLS_EXTRA_ARGS:-}"
 KBN_DEV_ES_STACK_LICENSE="${KBN_DEV_ES_STACK_LICENSE:-trial}"
 KBN_DEV_ES_STACK_ML_ENABLED="${KBN_DEV_ES_STACK_ML_ENABLED:-false}"
 KBN_DEV_ES_STACK_EXTRA_ARGS="${KBN_DEV_ES_STACK_EXTRA_ARGS:-}"
@@ -719,6 +721,7 @@ log_step "Starting ES Serverless..." "$ESSLS_LOG"
     yarn es serverless \
       --projectType "$KBN_DEV_ES_SLS_PROJECT_TYPE" \
       --clean --kill \
+      $KBN_DEV_ES_SLS_EXTRA_ARGS \
       $INFERENCE_FLAG \
     && break
 
