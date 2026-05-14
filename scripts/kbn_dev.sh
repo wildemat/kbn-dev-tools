@@ -903,6 +903,27 @@ monitor_process() {
   done
 }
 
+wait_for_es_http() {
+  local port="$1" label="$2" max_wait="${3:-30}"
+  local elapsed=0
+  log_step "Waiting for $label HTTP endpoint on port $port..."
+  while [ $elapsed -lt $max_wait ]; do
+    # Serverless uses HTTPS (self-signed), stateful uses HTTP — try both.
+    if curl -sk -o /dev/null -w '' "https://localhost:$port/" 2>/dev/null; then
+      log_step "$label HTTP endpoint ready (https, ${elapsed}s)"
+      return 0
+    fi
+    if curl -s -o /dev/null -w '' "http://localhost:$port/" 2>/dev/null; then
+      log_step "$label HTTP endpoint ready (http, ${elapsed}s)"
+      return 0
+    fi
+    sleep 2
+    elapsed=$((elapsed + 2))
+  done
+  log_step "WARNING: $label HTTP endpoint not reachable after ${max_wait}s — EIS may fail."
+  return 1
+}
+
 run_es_to_kibana_pipeline() {
   local es_label="$1" es_log="$2" es_pid="$3" es_ready_pattern="$4"
   local kbn_label="$5" kbn_start_fn="$6" kbn_log="$7" kbn_pidfile="$8"
@@ -916,8 +937,21 @@ run_es_to_kibana_pipeline() {
   log_step "$es_label is ready!"
 
   if [ "$CCM_ENABLED" = true ]; then
-    log_step "Running EIS setup for $es_label (ES_PORT=$es_port node scripts/eis.js)..."
-    (cd "$KBN_DIR" && ES_PORT="$es_port" node scripts/eis.js) >> "$MAIN_LOG" 2>&1
+    wait_for_es_http "$es_port" "$es_label"
+
+    local eis_ok=false
+    for eis_attempt in 1 2 3; do
+      log_step "Running EIS setup for $es_label (attempt $eis_attempt/3, ES_PORT=$es_port)..."
+      if (cd "$KBN_DIR" && ES_PORT="$es_port" node scripts/eis.js) >> "$MAIN_LOG" 2>&1; then
+        eis_ok=true
+        break
+      fi
+      log_step "EIS setup for $es_label failed (attempt $eis_attempt/3)."
+      sleep 3
+    done
+    if [ "$eis_ok" = false ]; then
+      log_step "WARNING: EIS setup failed for $es_label after 3 attempts. Kibana will start without EIS."
+    fi
   fi
 
   monitor_process "$kbn_label" "$kbn_start_fn" "$kbn_log" &
