@@ -18,8 +18,10 @@
 #   KBN_DEV_INFERENCE_URL        EIS URL. Set to "" to disable.
 #                                Default: "https://inference.eu-west-1.aws.svc.qa.elastic.cloud"
 #   KIBANA_EIS_CCM_API_KEY       EIS API key (skips vault). For CI.
+#   KBN_DEV_ES_SLS_PORT          Serverless ES HTTP port. Default: 9200
 #   KBN_DEV_ES_SLS_PROJECT_TYPE  Serverless project type. Default: elasticsearch_general_purpose
 #   KBN_DEV_ES_SLS_EXTRA_ARGS   Additional args for serverless ES.
+#   KBN_DEV_ES_STACK_PORT        Stateful ES HTTP port. Default: 9201
 #   KBN_DEV_ES_STACK_LICENSE     Stateful ES license. Default: trial
 #   KBN_DEV_ES_STACK_ML_ENABLED  Enable ML on stateful ES. Default: false
 #   KBN_DEV_ES_STACK_EXTRA_ARGS  Additional args for stateful ES.
@@ -33,7 +35,7 @@
 #   - yarn (ships with the kibana repo via corepack/volta/etc.)
 #   - Docker running (required by `yarn es`)
 #   - Google Chrome (auto-detected, or set CHROME_BIN)
-#   - Ports 5601, 5611, 9200, 9201, 9300, 9301 must be free
+#   - Ports 5601, 5611 and the ES ports (default 9200/9201/9300/9301) must be free
 #   - vault CLI (for EIS; skip with KIBANA_EIS_CCM_API_KEY or KBN_DEV_INFERENCE_URL="")
 # ---------------------------------------------------------------------------
 
@@ -154,10 +156,10 @@ write_status() {
   "log_dir": "$LOG_DIR",
   "kbn_dir": "$KBN_DIR",
   "clean": $CLEAN_CACHE,
-  "eis": $([ -n "$INFERENCE_FLAG" ] && echo "true" || echo "false"),
+  "eis": $([ "$CCM_ENABLED" = true ] && echo "true" || echo "false"),
   "components": {
-    "essls":     { "pid": "${ESSLS_PID:-null}",     "log": "$ESSLS_LOG",     "port": 9200 },
-    "esstack":   { "pid": "${ESSTACK_PID:-null}",   "log": "$ESSTACK_LOG",   "port": 9201 },
+    "essls":     { "pid": "${ESSLS_PID:-null}",     "log": "$ESSLS_LOG",     "port": $KBN_DEV_ES_SLS_PORT },
+    "esstack":   { "pid": "${ESSTACK_PID:-null}",   "log": "$ESSTACK_LOG",   "port": $KBN_DEV_ES_STACK_PORT },
     "optimizer": { "pid": "${OPTIMIZER_PID:-null}",  "log": "$OPTIMIZER_LOG"  },
     "kbnsls":    { "pid": "${KBNSLS_PID:-null}",    "log": "$KBNSLS_LOG",    "port": 5601, "url": "http://localhost:5601" },
     "kbnstack":  { "pid": "${KBNSTACK_PID:-null}",  "log": "$KBNSTACK_LOG",  "port": 5611, "url": "http://localhost:5611" }
@@ -518,24 +520,35 @@ done
 
 # --- Build inference flag ---------------------------------------------------
 KBN_DEV_INFERENCE_URL="${KBN_DEV_INFERENCE_URL:-https://inference.eu-west-1.aws.svc.qa.elastic.cloud}"
+CCM_ENABLED=false
 INFERENCE_FLAG=""
 if [ -n "$KBN_DEV_INFERENCE_URL" ]; then
-  INFERENCE_FLAG="-E xpack.inference.elastic.url=$KBN_DEV_INFERENCE_URL"
+  CCM_ENABLED=true
+  # Only pass the QA inference URL to ES when the user hasn't provided their
+  # own CCM key.  A user-supplied KIBANA_EIS_CCM_API_KEY means they connect to
+  # their own cloud EIS endpoint and the default QA URL would conflict.
+  if [ -z "${KIBANA_EIS_CCM_API_KEY:-}" ]; then
+    INFERENCE_FLAG="-E xpack.inference.elastic.url=$KBN_DEV_INFERENCE_URL"
+  fi
 fi
 
 # --- ES cluster overrides ---------------------------------------------------
+KBN_DEV_ES_SLS_PORT="${KBN_DEV_ES_SLS_PORT:-9200}"
 KBN_DEV_ES_SLS_PROJECT_TYPE="${KBN_DEV_ES_SLS_PROJECT_TYPE:-elasticsearch_general_purpose}"
 KBN_DEV_ES_SLS_EXTRA_ARGS="${KBN_DEV_ES_SLS_EXTRA_ARGS:-}"
+KBN_DEV_ES_STACK_PORT="${KBN_DEV_ES_STACK_PORT:-9201}"
 KBN_DEV_ES_STACK_LICENSE="${KBN_DEV_ES_STACK_LICENSE:-trial}"
 KBN_DEV_ES_STACK_ML_ENABLED="${KBN_DEV_ES_STACK_ML_ENABLED:-false}"
 KBN_DEV_ES_STACK_EXTRA_ARGS="${KBN_DEV_ES_STACK_EXTRA_ARGS:-}"
+KBN_DEV_ES_SLS_TRANSPORT_PORT=$((KBN_DEV_ES_SLS_PORT + 100))
+KBN_DEV_ES_STACK_TRANSPORT_PORT=$((KBN_DEV_ES_STACK_PORT + 100))
 
 # --- Vault pre-check for EIS -----------------------------------------------
 EIS_VAULT_ADDR="${VAULT_ADDR:-https://secrets.elastic.co:8200}"
 EIS_VAULT_SECRET="secret/kibana-issues/dev/inference/kibana-eis-ccm"
 
 setup_eis_vault() {
-  if [ -z "$INFERENCE_FLAG" ]; then
+  if [ "$CCM_ENABLED" = false ]; then
     return
   fi
 
@@ -558,6 +571,7 @@ setup_eis_vault() {
     echo "  ERROR: 'vault' CLI not found."
     echo "  To fix: install vault, set KIBANA_EIS_CCM_API_KEY, or set KBN_DEV_INFERENCE_URL=\"\""
     echo "  Continuing without EIS."
+    CCM_ENABLED=false
     INFERENCE_FLAG=""
     return
   fi
@@ -570,6 +584,7 @@ setup_eis_vault() {
 
     if [ "$INTERACTIVE" = false ]; then
       echo "  Vault access failed (non-interactive). Continuing without EIS."
+      CCM_ENABLED=false
       INFERENCE_FLAG=""
       return
     fi
@@ -613,7 +628,7 @@ echo " kbn-dev: Kibana dual-mode dev launcher"
 echo "============================================="
 echo "  Repo:      $KBN_DIR"
 echo "  Clean:     $CLEAN_CACHE"
-echo "  EIS:       $([ -n "$INFERENCE_FLAG" ] && echo "enabled ($KBN_DEV_INFERENCE_URL)" || echo "disabled")"
+echo "  EIS:       $([ "$CCM_ENABLED" = true ] && echo "enabled ($KBN_DEV_INFERENCE_URL)" || echo "disabled")"
 echo "  ES SLS:    projectType=$KBN_DEV_ES_SLS_PROJECT_TYPE"
 echo "  ES Stack:  license=$KBN_DEV_ES_STACK_LICENSE, ml=$KBN_DEV_ES_STACK_ML_ENABLED"
 echo "  Browser:   $([ "$LAUNCH_BROWSER" = true ] && echo "Chrome (kbn-sls + kbn-stack profiles)" || echo "disabled")"
@@ -653,8 +668,9 @@ write_status "starting"
 # PHASE 1: Check ports + start Elasticsearch clusters in parallel
 # =============================================================================
 
-log_step "Cleaning up stale kibana-ci Docker resources..."
-if command -v docker >/dev/null 2>&1; then
+clean_docker_sls() {
+  # Remove stale serverless containers (es01-03, uiam, uiam-cosmosdb)
+  local stale_ids
   stale_ids=$(docker ps -aq --filter "label=org.opencontainers.image.url=https://github.com/elastic/kibana" 2>/dev/null)
   if [ -z "$stale_ids" ]; then
     for img in uiam uiam-azure-cosmos-emulator elasticsearch-serverless; do
@@ -670,13 +686,6 @@ if command -v docker >/dev/null 2>&1; then
     echo "  No stale containers."
   fi
 
-  dangling=$(docker images -q --filter "dangling=true" --filter "reference=docker.elastic.co/kibana-ci/*" 2>/dev/null | xargs)
-  if [ -n "$dangling" ]; then
-    echo "  Removing dangling images: $dangling"
-    # shellcheck disable=SC2086
-    docker rmi $dangling 2>/dev/null || true
-  fi
-
   # Remove stale 'elastic' Docker network — stale DNS entries from crashed
   # containers can cause uiam to fail resolving uiam-cosmosdb.
   # Force-disconnect any lingering containers first, otherwise rm fails.
@@ -684,6 +693,18 @@ if command -v docker >/dev/null 2>&1; then
     docker network disconnect -f elastic "$cid" 2>/dev/null || true
   done
   docker network rm elastic 2>/dev/null || true
+}
+
+log_step "Cleaning up stale kibana-ci Docker resources..."
+if command -v docker >/dev/null 2>&1; then
+  clean_docker_sls
+
+  dangling=$(docker images -q --filter "dangling=true" --filter "reference=docker.elastic.co/kibana-ci/*" 2>/dev/null | xargs)
+  if [ -n "$dangling" ]; then
+    echo "  Removing dangling images: $dangling"
+    # shellcheck disable=SC2086
+    docker rmi $dangling 2>/dev/null || true
+  fi
 
   if [ "$CLEAN_CACHE" = true ]; then
     echo "  --clean: removing all kibana-ci images (will re-pull)..."
@@ -695,7 +716,7 @@ else
 fi
 
 log_step "Clearing dev ports..."
-for port in 9200 9201 9300 9301 5601 5611; do
+for port in $KBN_DEV_ES_SLS_PORT $KBN_DEV_ES_STACK_PORT $KBN_DEV_ES_SLS_TRANSPORT_PORT $KBN_DEV_ES_STACK_TRANSPORT_PORT 5601 5611; do
   pid=$(lsof -ti "tcp:$port" 2>/dev/null)
   if [ -n "$pid" ]; then
     proc_name=$(ps -p "$pid" -o comm= 2>/dev/null || echo "unknown")
@@ -713,25 +734,46 @@ log_step "Starting ES Serverless..." "$ESSLS_LOG"
 (
   cd "$KBN_DIR" || exit 1
 
-  # Retry up to 3 times in case of uiam/cosmosdb startup race.
-  # The Docker network cleanup before this step usually prevents the issue.
-  max_attempts=3
-  attempt=0
-  while [ $attempt -lt $max_attempts ]; do
-    attempt=$((attempt + 1))
-    [ $attempt -gt 1 ] && echo "" && echo "[$(date '+%Y-%m-%d %H:%M:%S')] ES Serverless attempt $attempt/$max_attempts..."
-
+  run_es_sls() {
     # shellcheck disable=SC2086
     yarn es serverless \
       --projectType "$KBN_DEV_ES_SLS_PROJECT_TYPE" \
       --clean --kill \
       $KBN_DEV_ES_SLS_EXTRA_ARGS \
-      $INFERENCE_FLAG \
-    && break
+      $INFERENCE_FLAG
+  }
+
+  # Retry up to 3 times in case of uiam/cosmosdb startup race.
+  # Between attempts, tear down the Docker network so uiam gets fresh DNS.
+  max_attempts=3
+  attempt=0
+  succeeded=false
+  while [ $attempt -lt $max_attempts ]; do
+    attempt=$((attempt + 1))
+    if [ $attempt -gt 1 ]; then
+      echo ""
+      echo "[$(date '+%Y-%m-%d %H:%M:%S')] Cleaning Docker network before retry..."
+      clean_docker_sls
+      echo "[$(date '+%Y-%m-%d %H:%M:%S')] ES Serverless attempt $attempt/$max_attempts..."
+    fi
+
+    run_es_sls && { succeeded=true; break; }
 
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] ES Serverless attempt $attempt/$max_attempts failed (uiam/cosmosdb startup race)."
     sleep 5
   done
+
+  # Nuclear fallback: full image purge + network teardown, then one last try.
+  if [ "$succeeded" = false ]; then
+    echo ""
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] All $max_attempts attempts failed. Running full Docker cleanup (equivalent to --clean)..."
+    clean_docker_sls
+    # shellcheck disable=SC2046
+    docker rmi $(docker images -q "docker.elastic.co/kibana-ci/*" 2>/dev/null) 2>/dev/null || true
+    docker volume prune -f 2>/dev/null || true
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] ES Serverless final attempt (after full cleanup)..."
+    run_es_sls
+  fi
 ) >> "$ESSLS_LOG" 2>&1 &
 ESSLS_PID=$!
 
@@ -741,8 +783,8 @@ log_step "Starting ES Stateful (snapshot)..." "$ESSTACK_LOG"
   # shellcheck disable=SC2086
   yarn es snapshot \
     --license "$KBN_DEV_ES_STACK_LICENSE" --clean \
-    -E http.port=9201 \
-    -E transport.port=9301 \
+    -E http.port=$KBN_DEV_ES_STACK_PORT \
+    -E transport.port=$KBN_DEV_ES_STACK_TRANSPORT_PORT \
     -E xpack.ml.enabled="$KBN_DEV_ES_STACK_ML_ENABLED" \
     $KBN_DEV_ES_STACK_EXTRA_ARGS \
     $INFERENCE_FLAG
@@ -809,7 +851,7 @@ start_kbnstack() {
     cd "$KBN_DIR" || exit 1
     export KBN_OPTIMIZER_USE_MAX_AVAILABLE_RESOURCES=false
     yarn start \
-      --elasticsearch http://localhost:9201 \
+      --elasticsearch http://localhost:$KBN_DEV_ES_STACK_PORT \
       --server.port=5611 \
       --xpack.security.cookieName=sid-stack \
       --no-optimizer
@@ -849,6 +891,7 @@ monitor_process() {
 run_es_to_kibana_pipeline() {
   local es_label="$1" es_log="$2" es_pid="$3" es_ready_pattern="$4"
   local kbn_label="$5" kbn_start_fn="$6" kbn_log="$7" kbn_pidfile="$8"
+  local es_port="${9:-9200}"
 
   log_step "Waiting for $es_label to be ready..."
   if ! wait_for_log "$es_log" "$es_ready_pattern" "$es_pid" "$es_label"; then
@@ -857,9 +900,9 @@ run_es_to_kibana_pipeline() {
 
   log_step "$es_label is ready!"
 
-  if [ -n "$INFERENCE_FLAG" ]; then
-    log_step "Running EIS setup for $es_label (node scripts/eis.js)..."
-    (cd "$KBN_DIR" && node scripts/eis.js) >> "$MAIN_LOG" 2>&1
+  if [ "$CCM_ENABLED" = true ]; then
+    log_step "Running EIS setup for $es_label (ES_PORT=$es_port node scripts/eis.js)..."
+    (cd "$KBN_DIR" && ES_PORT="$es_port" node scripts/eis.js) >> "$MAIN_LOG" 2>&1
   fi
 
   monitor_process "$kbn_label" "$kbn_start_fn" "$kbn_log" &
@@ -871,14 +914,14 @@ run_es_to_kibana_pipeline() {
 (
   run_es_to_kibana_pipeline \
     "ES Serverless" "$ESSLS_LOG" "$ESSLS_PID" "succ Serverless ES cluster running" \
-    "kbnsls" start_kbnsls "$KBNSLS_LOG" "$LOG_DIR/kbnsls.pid"
+    "kbnsls" start_kbnsls "$KBNSLS_LOG" "$LOG_DIR/kbnsls.pid" "$KBN_DEV_ES_SLS_PORT"
 ) &
 
 # Stateful pipeline (background)
 (
   run_es_to_kibana_pipeline \
     "ES Stateful" "$ESSTACK_LOG" "$ESSTACK_PID" "succ ES cluster is ready" \
-    "kbnstack" start_kbnstack "$KBNSTACK_LOG" "$LOG_DIR/kbnstack.pid"
+    "kbnstack" start_kbnstack "$KBNSTACK_LOG" "$LOG_DIR/kbnstack.pid" "$KBN_DEV_ES_STACK_PORT"
 ) &
 
 # =============================================================================

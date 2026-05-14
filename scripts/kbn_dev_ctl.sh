@@ -9,6 +9,7 @@
 #     [--follow]                         Follow (tail -f)
 #     [--grep PATTERN]                   Filter lines
 #   yarn kbn-dev-ctl restart <component>        Restart kbnsls or kbnstack
+#     [--kibana-only]                    Restart only Kibana, leave ES running
 #   yarn kbn-dev-ctl stop                       Stop the entire kbn-dev instance
 #
 # Components: essls, esstack, optimizer, kbnsls, kbnstack, all
@@ -145,6 +146,14 @@ cmd_status() {
     kbnstack_pid=$(grep -o '"kbnstack".*"pid": *"[^"]*"' "$STATUS_FILE" 2>/dev/null | grep -o '"pid": *"[^"]*"' | head -1 | sed 's/.*"pid": *"//;s/"//g') || true
   fi
 
+  # Pid files are updated by --kibana-only restarts; prefer them over stale status.json
+  if ! pid_alive "$kbnsls_pid" && [ -f "$LOG_DIR/kbnsls.pid" ]; then
+    kbnsls_pid=$(cat "$LOG_DIR/kbnsls.pid" 2>/dev/null)
+  fi
+  if ! pid_alive "$kbnstack_pid" && [ -f "$LOG_DIR/kbnstack.pid" ]; then
+    kbnstack_pid=$(cat "$LOG_DIR/kbnstack.pid" 2>/dev/null)
+  fi
+
   local essls_alive=false esstack_alive=false optimizer_alive=false
   local kbnsls_alive=false kbnstack_alive=false
   pid_alive "$essls_pid" && essls_alive=true
@@ -277,20 +286,122 @@ cmd_logs() {
 }
 
 # --- restart ----------------------------------------------------------------
-cmd_restart() {
-  local comp="${1:-}"
-  if [ "$comp" != "kbnsls" ] && [ "$comp" != "kbnstack" ] && [ "$comp" != "serverless" ] && [ "$comp" != "stateful" ] && [ "$comp" != "all" ]; then
-    echo "Usage: yarn kbn-dev-ctl restart <serverless|stateful|all>"
-    echo "  Restarts both ES and Kibana for the given mode."
-    echo "  Aliases: kbnsls = serverless, kbnstack = stateful"
-    exit 1
+restart_kibana_only() {
+  local comp="$1"
+
+  local kbn_dir=""
+  if [ -f "$STATUS_FILE" ]; then
+    kbn_dir=$(grep -o '"kbn_dir": *"[^"]*"' "$STATUS_FILE" 2>/dev/null | sed 's/.*"kbn_dir": *"//;s/"//g')
+  fi
+  if [ -z "$kbn_dir" ] || [ ! -d "$kbn_dir" ]; then
+    if [ -f "package.json" ] && grep -q '"name": "kibana"' package.json 2>/dev/null; then
+      kbn_dir="$(pwd)"
+    else
+      echo "ERROR: Cannot determine Kibana repo root."
+      echo "  Run from the kibana repo root or ensure kbn-dev is running."
+      exit 1
+    fi
   fi
 
-  # Normalize aliases
-  [ "$comp" = "kbnsls" ] && comp="serverless"
-  [ "$comp" = "kbnstack" ] && comp="stateful"
+  local es_stack_port="${KBN_DEV_ES_STACK_PORT:-9201}"
 
-  echo "Restarting $comp — this does a full stop + start."
+  local targets=""
+  if [ "$comp" = "serverless" ] || [ "$comp" = "all" ]; then targets="$targets serverless"; fi
+  if [ "$comp" = "stateful" ] || [ "$comp" = "all" ]; then targets="$targets stateful"; fi
+
+  for target in $targets; do
+    local port pidfile logfile label
+    if [ "$target" = "serverless" ]; then
+      port=5601
+      pidfile="$LOG_DIR/kbnsls.pid"
+      logfile="$LOG_DIR/kbnsls.log"
+      label="Kibana Serverless"
+    else
+      port=5611
+      pidfile="$LOG_DIR/kbnstack.pid"
+      logfile="$LOG_DIR/kbnstack.log"
+      label="Kibana Stateful"
+    fi
+
+    echo "Restarting $label (port $port) — ES cluster stays running."
+
+    # Kill the monitor process tree (monitor → start_fn subshell → yarn → node)
+    if [ -f "$pidfile" ]; then
+      local mon_pid
+      mon_pid=$(cat "$pidfile" 2>/dev/null)
+      if [ -n "$mon_pid" ] && kill -0 "$mon_pid" 2>/dev/null; then
+        echo "  Stopping monitor tree (PID $mon_pid)..."
+        pkill -TERM -g "$(ps -o pgid= -p "$mon_pid" 2>/dev/null | tr -d ' ')" 2>/dev/null || true
+        pkill -P "$mon_pid" 2>/dev/null || true
+        kill "$mon_pid" 2>/dev/null || true
+      fi
+    fi
+
+    # Kill all processes on the port — lsof can return multiple PIDs
+    local port_pids
+    port_pids=$(lsof -ti "tcp:$port" 2>/dev/null | tr '\n' ' ' || true)
+    if [ -n "$port_pids" ]; then
+      echo "  Killing $label on port $port (PIDs: $port_pids)..."
+      kill $port_pids 2>/dev/null || true
+      sleep 2
+      port_pids=$(lsof -ti "tcp:$port" 2>/dev/null | tr '\n' ' ' || true)
+      if [ -n "$port_pids" ]; then
+        echo "  Force-killing remaining PIDs: $port_pids"
+        kill -9 $port_pids 2>/dev/null || true
+        sleep 1
+      fi
+    fi
+
+    # Wait for the port to be fully released (TCP TIME_WAIT / kernel cleanup)
+    local wait_attempts=0
+    while lsof -ti "tcp:$port" >/dev/null 2>&1; do
+      wait_attempts=$((wait_attempts + 1))
+      if [ $wait_attempts -ge 10 ]; then
+        echo "  ERROR: port $port is still in use after kill attempts."
+        echo "  Check manually: lsof -ti tcp:$port"
+        continue 2
+      fi
+      echo "  Waiting for port $port to be released... ($wait_attempts)"
+      sleep 1
+    done
+
+    # Reset the log so readiness checks start fresh
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] --- $label restart (kibana-only) ---" > "$logfile"
+
+    echo "  Starting $label..."
+    if [ "$target" = "serverless" ]; then
+      nohup bash -c "
+        cd \"$kbn_dir\" || exit 1
+        export KBN_OPTIMIZER_USE_MAX_AVAILABLE_RESOURCES=false
+        exec yarn serverless-es \
+          --server.port=5601 \
+          --no-optimizer
+      " >> "$logfile" 2>&1 &
+    else
+      nohup bash -c "
+        cd \"$kbn_dir\" || exit 1
+        export KBN_OPTIMIZER_USE_MAX_AVAILABLE_RESOURCES=false
+        exec yarn start \
+          --elasticsearch \"http://localhost:$es_stack_port\" \
+          --server.port=5611 \
+          --xpack.security.cookieName=sid-stack \
+          --no-optimizer
+      " >> "$logfile" 2>&1 &
+    fi
+    local new_pid=$!
+    disown $new_pid 2>/dev/null || true
+    echo "$new_pid" > "$pidfile"
+    echo "  Started $label (PID $new_pid)"
+    echo ""
+  done
+
+  echo "  Use 'yarn kbn-dev-ctl status' to monitor."
+}
+
+restart_full() {
+  local comp="$1"
+
+  echo "Restarting $comp — full stop + start (ES and Kibana)."
   echo ""
 
   cmd_stop
@@ -329,6 +440,38 @@ cmd_restart() {
   fi
 }
 
+cmd_restart() {
+  local comp="${1:-}"
+  shift || true
+  local kibana_only=false
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --kibana-only) kibana_only=true; shift ;;
+      *) echo "Unknown option: $1" >&2; exit 1 ;;
+    esac
+  done
+
+  if [ "$comp" != "kbnsls" ] && [ "$comp" != "kbnstack" ] && [ "$comp" != "serverless" ] && [ "$comp" != "stateful" ] && [ "$comp" != "all" ]; then
+    echo "Usage: yarn kbn-dev-ctl restart <serverless|stateful|all> [--kibana-only]"
+    echo ""
+    echo "  Restarts the given mode. By default restarts both ES and Kibana."
+    echo "  --kibana-only   Restart only Kibana, leaving ES running."
+    echo "  Aliases: kbnsls = serverless, kbnstack = stateful"
+    exit 1
+  fi
+
+  # Normalize aliases
+  [ "$comp" = "kbnsls" ] && comp="serverless"
+  [ "$comp" = "kbnstack" ] && comp="stateful"
+
+  if [ "$kibana_only" = true ]; then
+    restart_kibana_only "$comp"
+  else
+    restart_full "$comp"
+  fi
+}
+
 # --- stop -------------------------------------------------------------------
 cmd_stop() {
   local main_pid=""
@@ -358,7 +501,8 @@ case "${1:-status}" in
     echo "  status [--json]              Show component health"
     echo "  logs <component> [options]   View component logs"
     echo "  attach                       Attach to the tmux log viewer"
-    echo "  restart <serverless|stateful|all>  Full restart (ES + Kibana)"
+    echo "  restart <serverless|stateful|all>  Restart (ES + Kibana)"
+    echo "    --kibana-only                    Restart only Kibana, leave ES running"
     echo "  stop                         Stop the kbn-dev instance"
     echo ""
     echo "Components: essls, esstack, optimizer, kbnsls, kbnstack, main, all"
