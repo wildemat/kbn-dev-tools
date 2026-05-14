@@ -46,6 +46,9 @@ INTERACTIVE=true
 [ -t 0 ] || INTERACTIVE=false
 SHUTTING_DOWN=false
 
+# --- Defaults for Kibana env vars (overridable via .env) --------------------
+export KBN_USE_RSPACK="${KBN_USE_RSPACK:-true}"
+
 # --- Source .env overrides --------------------------------------------------
 # KBN_DEV_ENV_FILE is set by the installer (in shell profile).
 # Falls back to .env next to this script (for running directly from the repo).
