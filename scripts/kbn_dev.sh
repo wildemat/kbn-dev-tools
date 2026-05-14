@@ -646,6 +646,7 @@ echo "  Clean:     $CLEAN_CACHE"
 echo "  EIS:       $([ "$CCM_ENABLED" = true ] && echo "enabled ($KBN_DEV_INFERENCE_URL)" || echo "disabled")"
 echo "  ES SLS:    projectType=$KBN_DEV_ES_SLS_PROJECT_TYPE"
 echo "  ES Stack:  license=$KBN_DEV_ES_STACK_LICENSE, ml=$KBN_DEV_ES_STACK_ML_ENABLED, saml=$([ -z "$STACK_MOCK_IDP_FLAGS" ] && echo "enabled" || echo "disabled")"
+echo "  Optimizer: $([ "$KBN_USE_RSPACK" = "true" ] || [ "$KBN_USE_RSPACK" = "1" ] && echo "rspack" || echo "webpack (legacy)")"
 echo "  Browser:   $([ "$LAUNCH_BROWSER" = true ] && echo "Chrome (kbn-sls + kbn-stack profiles)" || echo "disabled")"
 echo "  Show logs: $SHOW_LOGS"
 echo "============================================="
@@ -830,16 +831,35 @@ if [ $BOOTSTRAP_EXIT -ne 0 ]; then
   cleanup
 fi
 
-log_step "Starting optimizer (watch mode)..."
-(
-  cd "$KBN_DIR" || exit 1
-  node scripts/build_kibana_platform_plugins --watch
-) >> "$OPTIMIZER_LOG" 2>&1 &
-OPTIMIZER_PID=$!
+USE_RSPACK=false
+if [ "$KBN_USE_RSPACK" = "true" ] || [ "$KBN_USE_RSPACK" = "1" ]; then
+  USE_RSPACK=true
+fi
 
-log_step "Waiting for optimizer initial build..."
-if wait_for_log "$OPTIMIZER_LOG" "succ.*bundles compiled successfully\|succ all bundles cached" "$OPTIMIZER_PID" "Optimizer"; then
-  log_step "Optimizer build complete!"
+if [ "$USE_RSPACK" = true ]; then
+  log_step "Starting rspack optimizer (watch mode)..."
+  (
+    cd "$KBN_DIR" || exit 1
+    node scripts/build_rspack_bundles.js --watch
+  ) >> "$OPTIMIZER_LOG" 2>&1 &
+  OPTIMIZER_PID=$!
+
+  log_step "Waiting for rspack initial build..."
+  if wait_for_log "$OPTIMIZER_LOG" "RSPack build completed\|Watching for changes" "$OPTIMIZER_PID" "Rspack Optimizer"; then
+    log_step "Rspack optimizer build complete!"
+  fi
+else
+  log_step "Starting webpack optimizer (watch mode)..."
+  (
+    cd "$KBN_DIR" || exit 1
+    node scripts/build_kibana_platform_plugins --watch
+  ) >> "$OPTIMIZER_LOG" 2>&1 &
+  OPTIMIZER_PID=$!
+
+  log_step "Waiting for optimizer initial build..."
+  if wait_for_log "$OPTIMIZER_LOG" "succ.*bundles compiled successfully\|succ all bundles cached" "$OPTIMIZER_PID" "Optimizer"; then
+    log_step "Optimizer build complete!"
+  fi
 fi
 
 write_status "optimizer_ready"
@@ -876,9 +896,33 @@ start_kbnstack() {
   ) >> "$KBNSTACK_LOG" 2>&1
 }
 
+needs_bootstrap() {
+  local logfile="$1"
+  local tail_lines
+  tail_lines=$(tail -80 "$logfile" 2>/dev/null)
+  if echo "$tail_lines" | grep -qE "Cannot find module|MODULE_NOT_FOUND|ENOENT.*node_modules"; then
+    return 0
+  fi
+  return 1
+}
+
+run_bootstrap() {
+  local clean="$1"
+  log_step "Running auto-bootstrap (clean=$clean)..." "$MAIN_LOG"
+  (
+    cd "$KBN_DIR" || return 1
+    if [ "$clean" = true ]; then
+      yarn kbn clean >> "$MAIN_LOG" 2>&1 || true
+    fi
+    yarn kbn bootstrap >> "$MAIN_LOG" 2>&1
+  )
+  return $?
+}
+
 monitor_process() {
   local name="$1" start_fn="$2" logfile="$3"
   local failures=0 max_failures=3
+  local bootstrap_attempts=0 max_bootstrap=2
 
   while true; do
     $start_fn &
@@ -891,6 +935,26 @@ monitor_process() {
     elif [ $exit_code -ne 0 ]; then
       failures=$((failures + 1))
       log_step "$name exited with code $exit_code (attempt $failures/$max_failures)" "$logfile"
+
+      if needs_bootstrap "$logfile"; then
+        bootstrap_attempts=$((bootstrap_attempts + 1))
+        if [ $bootstrap_attempts -le $max_bootstrap ]; then
+          local do_clean=false
+          [ $bootstrap_attempts -gt 1 ] && do_clean=true
+          log_step "$name crashed due to missing module — auto-bootstrapping (attempt $bootstrap_attempts/$max_bootstrap, clean=$do_clean)..." "$logfile"
+          if run_bootstrap "$do_clean"; then
+            log_step "Bootstrap succeeded. Restarting $name..."
+            failures=$((failures - 1))
+            sleep 2
+            continue
+          else
+            log_step "Bootstrap failed. Check $MAIN_LOG" "$logfile"
+          fi
+        else
+          log_step "$name still failing after $max_bootstrap bootstrap attempts." "$logfile"
+        fi
+      fi
+
       if [ $failures -lt $max_failures ]; then
         log_step "Restarting $name in 5s..."
         sleep 5
