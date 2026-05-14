@@ -162,7 +162,7 @@ write_status() {
     "esstack":   { "pid": "${ESSTACK_PID:-null}",   "log": "$ESSTACK_LOG",   "port": $KBN_DEV_ES_STACK_PORT },
     "optimizer": { "pid": "${OPTIMIZER_PID:-null}",  "log": "$OPTIMIZER_LOG"  },
     "kbnsls":    { "pid": "${KBNSLS_PID:-null}",    "log": "$KBNSLS_LOG",    "port": 5601, "url": "http://localhost:5601" },
-    "kbnstack":  { "pid": "${KBNSTACK_PID:-null}",  "log": "$KBNSTACK_LOG",  "port": 5611, "url": "http://localhost:5611" }
+    "kbnstack":  { "pid": "${KBNSTACK_PID:-null}",  "log": "$KBNSTACK_LOG",  "port": 5611, "url": "$STACK_KBN_URL" }
   }$([ $# -gt 0 ] && echo ","; for kv in "$@"; do echo "  $kv"; done)
 }
 STATUSEOF
@@ -543,6 +543,18 @@ KBN_DEV_ES_STACK_EXTRA_ARGS="${KBN_DEV_ES_STACK_EXTRA_ARGS:-}"
 KBN_DEV_ES_SLS_TRANSPORT_PORT=$((KBN_DEV_ES_SLS_PORT + 100))
 KBN_DEV_ES_STACK_TRANSPORT_PORT=$((KBN_DEV_ES_STACK_PORT + 100))
 
+# --- Mock IdP / SAML (stateful) ---------------------------------------------
+# PR elastic/kibana#263998 enabled SAML Mock IdP for stateful by default.
+# `yarn es snapshot` auto-configures a SAML realm whose SP/ACS URLs must match
+# Kibana's host:port/basePath. The fixed basePath is /kbn (MOCK_IDP_KIBANA_BASE_PATH).
+# For basic license, SAML is unsupported — disable the plugin + basePath entirely.
+STACK_MOCK_IDP_FLAGS=""
+STACK_KBN_URL="http://localhost:5611/kbn"
+if [ "$KBN_DEV_ES_STACK_LICENSE" = "basic" ]; then
+  STACK_MOCK_IDP_FLAGS="--mockIdpPlugin.enabled=false --no-base-path"
+  STACK_KBN_URL="http://localhost:5611"
+fi
+
 # --- Vault pre-check for EIS -----------------------------------------------
 EIS_VAULT_ADDR="${VAULT_ADDR:-https://secrets.elastic.co:8200}"
 EIS_VAULT_SECRET="secret/kibana-issues/dev/inference/kibana-eis-ccm"
@@ -630,7 +642,7 @@ echo "  Repo:      $KBN_DIR"
 echo "  Clean:     $CLEAN_CACHE"
 echo "  EIS:       $([ "$CCM_ENABLED" = true ] && echo "enabled ($KBN_DEV_INFERENCE_URL)" || echo "disabled")"
 echo "  ES SLS:    projectType=$KBN_DEV_ES_SLS_PROJECT_TYPE"
-echo "  ES Stack:  license=$KBN_DEV_ES_STACK_LICENSE, ml=$KBN_DEV_ES_STACK_ML_ENABLED"
+echo "  ES Stack:  license=$KBN_DEV_ES_STACK_LICENSE, ml=$KBN_DEV_ES_STACK_ML_ENABLED, saml=$([ -z "$STACK_MOCK_IDP_FLAGS" ] && echo "enabled" || echo "disabled")"
 echo "  Browser:   $([ "$LAUNCH_BROWSER" = true ] && echo "Chrome (kbn-sls + kbn-stack profiles)" || echo "disabled")"
 echo "  Show logs: $SHOW_LOGS"
 echo "============================================="
@@ -783,6 +795,7 @@ log_step "Starting ES Stateful (snapshot)..." "$ESSTACK_LOG"
   # shellcheck disable=SC2086
   yarn es snapshot \
     --license "$KBN_DEV_ES_STACK_LICENSE" --clean \
+    --kibanaUrl "$STACK_KBN_URL" \
     -E http.port=$KBN_DEV_ES_STACK_PORT \
     -E transport.port=$KBN_DEV_ES_STACK_TRANSPORT_PORT \
     -E xpack.ml.enabled="$KBN_DEV_ES_STACK_ML_ENABLED" \
@@ -850,11 +863,13 @@ start_kbnstack() {
   (
     cd "$KBN_DIR" || exit 1
     export KBN_OPTIMIZER_USE_MAX_AVAILABLE_RESOURCES=false
+    # shellcheck disable=SC2086
     yarn start \
       --elasticsearch http://localhost:$KBN_DEV_ES_STACK_PORT \
       --server.port=5611 \
       --xpack.security.cookieName=sid-stack \
-      --no-optimizer
+      --no-optimizer \
+      $STACK_MOCK_IDP_FLAGS
   ) >> "$KBNSTACK_LOG" 2>&1
 }
 
@@ -964,9 +979,9 @@ if [ -f "$SLS_MARKER" ]; then
 fi
 
 if [ -f "$STACK_MARKER" ]; then
-  log_step "Kibana Stateful is available at http://localhost:5611"
+  log_step "Kibana Stateful is available at $STACK_KBN_URL"
   STACK_READY=true
-  open_chrome "http://localhost:5611" "$STACK_PROFILE"
+  open_chrome "$STACK_KBN_URL" "$STACK_PROFILE"
   STACK_CHROME_PID="$LAST_CHROME_PID"
 fi
 
@@ -1016,7 +1031,7 @@ echo "============================================="
 echo ""
 [ "$SLS_READY" = true ]   && echo "  [OK]     Kibana Serverless:  http://localhost:5601" \
                            || echo "  [FAILED] Kibana Serverless — check $KBNSLS_LOG"
-[ "$STACK_READY" = true ]  && echo "  [OK]     Kibana Stateful:    http://localhost:5611" \
+[ "$STACK_READY" = true ]  && echo "  [OK]     Kibana Stateful:    $STACK_KBN_URL" \
                            || echo "  [FAILED] Kibana Stateful — check $KBNSTACK_LOG"
 echo ""
 echo "  PIDs:"

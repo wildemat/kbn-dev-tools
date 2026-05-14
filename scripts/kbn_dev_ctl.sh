@@ -304,6 +304,11 @@ restart_kibana_only() {
   fi
 
   local es_stack_port="${KBN_DEV_ES_STACK_PORT:-9201}"
+  local es_stack_license="${KBN_DEV_ES_STACK_LICENSE:-trial}"
+  local stack_mock_idp_flags=""
+  if [ "$es_stack_license" = "basic" ]; then
+    stack_mock_idp_flags="--mockIdpPlugin.enabled=false --no-base-path"
+  fi
 
   local targets=""
   if [ "$comp" = "serverless" ] || [ "$comp" = "all" ]; then targets="$targets serverless"; fi
@@ -385,7 +390,8 @@ restart_kibana_only() {
           --elasticsearch \"http://localhost:$es_stack_port\" \
           --server.port=5611 \
           --xpack.security.cookieName=sid-stack \
-          --no-optimizer
+          --no-optimizer \
+          $stack_mock_idp_flags
       " >> "$logfile" 2>&1 &
     fi
     local new_pid=$!
