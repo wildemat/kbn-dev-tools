@@ -330,19 +330,10 @@ restart_kibana_only() {
 
     echo "Restarting $label (port $port) — ES cluster stays running."
 
-    # Kill the monitor process tree (monitor → start_fn subshell → yarn → node)
-    if [ -f "$pidfile" ]; then
-      local mon_pid
-      mon_pid=$(cat "$pidfile" 2>/dev/null)
-      if [ -n "$mon_pid" ] && kill -0 "$mon_pid" 2>/dev/null; then
-        echo "  Stopping monitor tree (PID $mon_pid)..."
-        pkill -TERM -g "$(ps -o pgid= -p "$mon_pid" 2>/dev/null | tr -d ' ')" 2>/dev/null || true
-        pkill -P "$mon_pid" 2>/dev/null || true
-        kill "$mon_pid" 2>/dev/null || true
-      fi
-    fi
-
-    # Kill all processes on the port — lsof can return multiple PIDs
+    # Kill Kibana on the port first (the actual node process), then clean up
+    # the monitor. Avoid pkill -g (process-group kill) because the monitor
+    # shares a process group with the main kbn-dev script — killing the group
+    # would SIGTERM the parent and trigger a full shutdown.
     local port_pids
     port_pids=$(lsof -ti "tcp:$port" 2>/dev/null | tr '\n' ' ' || true)
     if [ -n "$port_pids" ]; then
@@ -353,6 +344,18 @@ restart_kibana_only() {
       if [ -n "$port_pids" ]; then
         echo "  Force-killing remaining PIDs: $port_pids"
         kill -9 $port_pids 2>/dev/null || true
+        sleep 1
+      fi
+    fi
+
+    # Kill the monitor process and its direct children (yarn/node subshells)
+    if [ -f "$pidfile" ]; then
+      local mon_pid
+      mon_pid=$(cat "$pidfile" 2>/dev/null)
+      if [ -n "$mon_pid" ] && kill -0 "$mon_pid" 2>/dev/null; then
+        echo "  Stopping monitor (PID $mon_pid)..."
+        pkill -P "$mon_pid" 2>/dev/null || true
+        kill "$mon_pid" 2>/dev/null || true
         sleep 1
       fi
     fi
