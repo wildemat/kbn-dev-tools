@@ -490,8 +490,8 @@ cleanup() {
     fi
   done
 
-  # Kill any remaining node processes on Kibana ports
-  for port in 5601 5611; do
+  # Kill any remaining node processes on Kibana ports (5678 = rspack optimizer)
+  for port in 5601 5611 5678; do
     local port_pid
     port_pid=$(lsof -ti "tcp:$port" 2>/dev/null)
     if [ -n "$port_pid" ]; then
@@ -856,6 +856,7 @@ if [ "$KBN_USE_RSPACK" = "true" ] || [ "$KBN_USE_RSPACK" = "1" ]; then
 fi
 
 if [ "$USE_RSPACK" = true ]; then
+  kill_port 5678
   log_step "Starting rspack optimizer (watch mode)..."
   (
     cd "$KBN_DIR" || exit 1
