@@ -192,7 +192,7 @@ STATUSEOF
 
 # --- Intro banner (interactive only) ----------------------------------------
 if [ "$INTERACTIVE" = true ]; then
-  cat <<'BANNER'
+  cat <<BANNER
 
 =============================================
  kbn-dev — Kibana dual-mode dev launcher
@@ -210,8 +210,7 @@ if [ "$INTERACTIVE" = true ]; then
               or KBN_DEV_INFERENCE_URL="")
 
  Configuration:
-   Edit .env in the kbn-dev-tools directory to customize.
-   See .env.dev for all KBN_DEV_* variables with descriptions.
+   Edit $KBN_DEV_ENV_FILE to customize.
 
  Flags:
    --clean                  Wipe .es/cache and run 'yarn kbn clean'
@@ -671,10 +670,8 @@ echo "  Dir: $LOG_DIR"
 echo "  Override with: KBN_DEV_LOG_DIR=/your/path"
 if [ "$SHOW_LOGS" = true ]; then
   if command -v tmux >/dev/null 2>&1; then
-    echo "  Tmux log viewer will open automatically (--quiet to disable)."
-    echo "  Attach:  tmux attach -t kbn-logs"
-    echo "  Detach:  Ctrl+B then D"
-    echo "  Kill:    tmux kill-session -t kbn-logs"
+    echo "  Tmux session 'kbn-logs' will be created (detached). Run 'kbn-dev-ctl attach' to open."
+    echo "  Use --quiet to skip."
   else
     echo "  WARNING: tmux not found. Install tmux for the log viewer."
     echo "  Falling back to individual tail commands."
