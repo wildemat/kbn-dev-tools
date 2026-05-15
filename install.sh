@@ -11,9 +11,13 @@
 #   git clone https://github.com/wildemat/kbn-dev-tools && cd kbn-dev-tools && ./install.sh
 #
 # What it does:
-#   1. Copies kbn-dev and kbn-dev-ctl to ~/.local/bin/ (added to PATH)
-#   2. Installs Claude Code agent skills to ~/.claude/skills/ (and ~/.agents/skills/ if it exists)
-#   3. Verifies prerequisites (Docker; optionally a node version manager)
+#   1. Installs kbn-dev and kbn-dev-ctl to ~/.local/bin/ (added to PATH).
+#      - When run from a local checkout: symlinks (so repo edits go live).
+#      - When run via curl | sh: copies (the bootstrap tmpdir is ephemeral).
+#      - Override with KBN_DEV_INSTALL_MODE=copy or =symlink.
+#   2. Creates ~/.kbn-dev/.env from the .env.dev template (if missing).
+#   3. Installs Claude Code agent skills to ~/.claude/skills/ (and ~/.agents/skills/ if it exists).
+#   4. Verifies prerequisites (Docker; optionally a node version manager).
 #
 # Prerequisites:
 #   - Docker
@@ -29,12 +33,15 @@ BRANCH="main"
 
 # When run via curl | sh, $0 is "bash" and there are no local files.
 # Bootstrap by downloading the repo tarball and re-executing from there.
+# The _KBN_DEV_BOOTSTRAP flag tells the inner run to copy (not symlink) scripts,
+# since the tmpdir won't survive past install.
 if [ ! -f "$(dirname "$0")/scripts/kbn_dev.sh" ] && [ ! -f "$(dirname "$0")/kbn_dev.sh" ]; then
   echo "Downloading kbn-dev-tools..."
   _tmpdir="$(mktemp -d)"
   trap 'rm -rf "$_tmpdir"' EXIT
   curl -fsSL "https://github.com/$REPO/archive/refs/heads/$BRANCH.tar.gz" \
     | tar -xz -C "$_tmpdir" --strip-components=1
+  export _KBN_DEV_BOOTSTRAP=1
   exec bash "$_tmpdir/install.sh" "$@"
 fi
 
@@ -107,61 +114,56 @@ fi
 echo ""
 
 # --- Install scripts ------------------------------------------------------
-echo "Installing scripts to $INSTALL_DIR..."
+# Symlink when running from a real checkout so edits to the repo are picked up
+# live (and the scripts/ detection in kbn_dev.sh resolves through the link to
+# load the repo's .env). Copy when bootstrapped via curl | sh, since the
+# tmpdir vanishes after install. Force copy with KBN_DEV_INSTALL_MODE=copy.
+install_mode="${KBN_DEV_INSTALL_MODE:-}"
+if [ -z "$install_mode" ]; then
+  if [ "${_KBN_DEV_BOOTSTRAP:-0}" = "1" ]; then
+    install_mode="copy"
+  else
+    install_mode="symlink"
+  fi
+fi
+
+echo "Installing scripts to $INSTALL_DIR ($install_mode)..."
 mkdir -p "$INSTALL_DIR"
 
-cp "$SCRIPTS_SRC/kbn_dev.sh" "$INSTALL_DIR/kbn-dev"
-cp "$SCRIPTS_SRC/kbn_dev_ctl.sh" "$INSTALL_DIR/kbn-dev-ctl"
-chmod +x "$INSTALL_DIR/kbn-dev" "$INSTALL_DIR/kbn-dev-ctl"
+install_one() {
+  local src="$1" dest="$2"
+  rm -f "$dest"
+  if [ "$install_mode" = "symlink" ]; then
+    ln -s "$src" "$dest"
+  else
+    cp "$src" "$dest"
+    chmod +x "$dest"
+  fi
+}
+
+install_one "$SCRIPTS_SRC/kbn_dev.sh" "$INSTALL_DIR/kbn-dev"
+install_one "$SCRIPTS_SRC/kbn_dev_ctl.sh" "$INSTALL_DIR/kbn-dev-ctl"
 
 echo "  Installed: $INSTALL_DIR/kbn-dev"
 echo "  Installed: $INSTALL_DIR/kbn-dev-ctl"
 
 # --- Create .env from template if it doesn't exist ------------------------
-if [ -f "$KBN_DEV_SCRIPT_DIR/.env.dev" ] && [ ! -f "$KBN_DEV_SCRIPT_DIR/.env" ]; then
-  cp "$KBN_DEV_SCRIPT_DIR/.env.dev" "$KBN_DEV_SCRIPT_DIR/.env"
-  echo "  Created:   .env (from .env.dev — edit to customize)"
+KBN_DEV_HOME="${KBN_DEV_HOME:-$HOME/.kbn-dev}"
+mkdir -p "$KBN_DEV_HOME"
+ENV_FILE_PATH="$KBN_DEV_HOME/.env"
+
+if [ ! -f "$ENV_FILE_PATH" ] && [ -f "$KBN_DEV_SCRIPT_DIR/.env.dev" ]; then
+  cp "$KBN_DEV_SCRIPT_DIR/.env.dev" "$ENV_FILE_PATH"
+  echo "  Created:   $ENV_FILE_PATH (from .env.dev — edit to customize)"
+else
+  echo "  Existing:  $ENV_FILE_PATH (not overwritten)"
 fi
 
-# --- Ensure PATH includes install dir -------------------------------------
+# --- Check PATH (informational only — installer never edits shell profiles) -
 path_ok=false
 case ":$PATH:" in
   *":$INSTALL_DIR:"*) path_ok=true ;;
 esac
-
-KBN_DEV_TOOLS_ROOT="$(cd "$KBN_DEV_SCRIPT_DIR" && pwd)"
-ENV_FILE_PATH="$KBN_DEV_TOOLS_ROOT/.env"
-
-shell_rc=""
-case "${SHELL:-}" in
-  */zsh)  shell_rc="$HOME/.zshrc" ;;
-  */bash) shell_rc="$HOME/.bashrc" ;;
-esac
-
-if [ "$path_ok" = false ]; then
-  if [ -n "$shell_rc" ]; then
-    echo ""
-    echo "  $INSTALL_DIR is not in your PATH."
-    echo "  Adding to $shell_rc..."
-    echo "" >> "$shell_rc"
-    echo "# kbn-dev-tools" >> "$shell_rc"
-    echo "export PATH=\"$INSTALL_DIR:\$PATH\"" >> "$shell_rc"
-    echo "export KBN_DEV_ENV_FILE=\"$ENV_FILE_PATH\"" >> "$shell_rc"
-    echo "  Done. Run: source $shell_rc"
-  else
-    echo ""
-    echo "  $INSTALL_DIR is not in your PATH."
-    echo "  Add this to your shell profile:"
-    echo "    export PATH=\"$INSTALL_DIR:\$PATH\""
-    echo "    export KBN_DEV_ENV_FILE=\"$ENV_FILE_PATH\""
-  fi
-else
-  # PATH is fine, but ensure KBN_DEV_ENV_FILE is exported
-  if [ -n "$shell_rc" ] && ! grep -qF "KBN_DEV_ENV_FILE" "$shell_rc" 2>/dev/null; then
-    echo "export KBN_DEV_ENV_FILE=\"$ENV_FILE_PATH\"" >> "$shell_rc"
-    echo "  Added KBN_DEV_ENV_FILE to $shell_rc. Run: source $shell_rc"
-  fi
-fi
 
 echo ""
 
@@ -225,15 +227,18 @@ echo "    kbn-dev-ctl status    # check health"
 echo "    kbn-dev-ctl attach    # open tmux log viewer"
 echo ""
 echo "  Configuration:"
-echo "    Edit .env in this directory to override defaults."
+echo "    Edit $ENV_FILE_PATH to override defaults."
+if [ "$install_mode" = "symlink" ]; then
+  echo "    Or drop a .env in $KBN_DEV_SCRIPT_DIR/ for repo-local overrides."
+fi
 echo ""
 echo "  Claude Code skills:"
 echo "    /kbn-dev              # start/stop/restart"
 echo "    /kbn-dev-status       # quick status check"
-echo ""
-if [ -n "$shell_rc" ]; then
-  echo "  >>> Run this to make sure the correct environment variables are used:"
+if [ "$path_ok" = false ]; then
   echo ""
-  echo "      source $shell_rc"
+  echo "  >>> $INSTALL_DIR is not on your PATH. Add this to your shell profile:"
+  echo ""
+  echo "      export PATH=\"$INSTALL_DIR:\$PATH\""
   echo ""
 fi

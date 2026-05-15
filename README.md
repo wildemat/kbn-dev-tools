@@ -75,7 +75,20 @@ authentication screens in browser automation, and diagnose failures.
 
 ## Configuration
 
-The installer creates a `.env` file in the kbn-dev-tools directory. Edit it to override defaults — it's gitignored and sourced automatically by `kbn-dev` on startup. See `.env.dev` for all available variables with inline documentation.
+The installer creates `~/.kbn-dev/.env` from the `.env.dev` template. Edit it to override defaults — it's sourced automatically by `kbn-dev` on startup. See `.env.dev` for all available variables with inline documentation.
+
+**Resolution order** (`kbn-dev` picks the first that exists):
+
+1. `$KBN_DEV_ENV_FILE` if set (explicit override)
+2. `<repo>/.env` if the running executable resolves into a kbn-dev-tools checkout
+3. `~/.kbn-dev/.env` (installed default)
+
+**Developing against the repo:** running `./install.sh` from a local clone installs `~/.local/bin/kbn-dev` as a **symlink** into the checkout, so:
+
+- Edits to `scripts/kbn_dev.sh` are picked up live (no reinstall)
+- A `.env` in the repo root is picked up automatically (it shadows `~/.kbn-dev/.env` because the symlink resolves into the `scripts/` layout)
+
+Installs via `curl | sh` always **copy** the scripts (the bootstrap tmpdir disappears after install). Force a copy from a local checkout with `KBN_DEV_INSTALL_MODE=copy ./install.sh`.
 
 ## Environment variables
 
@@ -100,8 +113,8 @@ All kbn-dev-specific variables use the `KBN_DEV_` prefix to avoid collisions wit
 kbn-dev-tools/
 ├── install.sh              # One-step installer
 ├── README.md
-├── .env.dev                # Default env var template
-├── .env                    # Your local overrides (created by installer, gitignored)
+├── .env.dev                # Default env var template (copied to ~/.kbn-dev/.env on install)
+├── .env                    # Optional repo-local overrides for development (gitignored)
 ├── scripts/
 │   ├── kbn_dev.sh          # Orchestrator (starts everything)
 │   └── kbn_dev_ctl.sh      # Control plane (status/logs/restart/stop)

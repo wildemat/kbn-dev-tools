@@ -50,10 +50,25 @@ SHUTTING_DOWN=false
 export KBN_USE_RSPACK="${KBN_USE_RSPACK:-true}"
 
 # --- Source .env overrides --------------------------------------------------
-# KBN_DEV_ENV_FILE is set by the installer (in shell profile).
-# Falls back to .env next to this script (for running directly from the repo).
+# Resolution order:
+#   1. $KBN_DEV_ENV_FILE if set (explicit override)
+#   2. <repo>/.env if this script resolves into a repo checkout
+#      (scripts/kbn_dev.sh layout; works through symlinks from ~/.local/bin)
+#   3. ~/.kbn-dev/.env (installed default)
 if [ -z "${KBN_DEV_ENV_FILE:-}" ]; then
-  KBN_DEV_ENV_FILE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/.env"
+  _kbn_src="${BASH_SOURCE[0]}"
+  while [ -L "$_kbn_src" ]; do
+    _kbn_dir="$(cd "$(dirname "$_kbn_src")" && pwd)"
+    _kbn_src="$(readlink "$_kbn_src")"
+    case "$_kbn_src" in /*) ;; *) _kbn_src="$_kbn_dir/$_kbn_src" ;; esac
+  done
+  _kbn_dev_parent="$(cd "$(dirname "$_kbn_src")" && pwd)"
+  if [ "$(basename "$_kbn_dev_parent")" = "scripts" ] && [ -f "$(dirname "$_kbn_dev_parent")/.env" ]; then
+    KBN_DEV_ENV_FILE="$(dirname "$_kbn_dev_parent")/.env"
+  else
+    KBN_DEV_ENV_FILE="${KBN_DEV_HOME:-$HOME/.kbn-dev}/.env"
+  fi
+  unset _kbn_dev_parent _kbn_src _kbn_dir
 fi
 if [ -f "$KBN_DEV_ENV_FILE" ]; then
   # shellcheck disable=SC1090
