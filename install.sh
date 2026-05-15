@@ -130,19 +130,37 @@ fi
 echo "Installing scripts to $INSTALL_DIR ($install_mode)..."
 mkdir -p "$INSTALL_DIR"
 
+KBN_DEV_HOME="${KBN_DEV_HOME:-$HOME/.kbn-dev}"
+ENV_FILE_PATH="$KBN_DEV_HOME/.env"
+
 install_one() {
-  local src="$1" dest="$2"
+  local src="$1" dest="$2" pin_env_file="${3:-false}"
   rm -f "$dest"
   if [ "$install_mode" = "symlink" ]; then
     ln -s "$src" "$dest"
   else
     cp "$src" "$dest"
     chmod +x "$dest"
+    # In copy mode, lock KBN_DEV_ENV_FILE to the installed default so the
+    # auto-detect block (which resolves scripts/.. when present) doesn't
+    # accidentally pick up an unrelated repo's .env. Users can still
+    # override by exporting KBN_DEV_ENV_FILE before invoking the command.
+    if [ "$pin_env_file" = true ]; then
+      local tmpfile
+      tmpfile="$(mktemp)"
+      {
+        head -n 1 "$dest"
+        echo ": \"\${KBN_DEV_ENV_FILE:=$ENV_FILE_PATH}\""
+        tail -n +2 "$dest"
+      } > "$tmpfile"
+      mv "$tmpfile" "$dest"
+      chmod +x "$dest"
+    fi
   fi
 }
 
-install_one "$SCRIPTS_SRC/kbn_dev.sh" "$INSTALL_DIR/kbn-dev"
-install_one "$SCRIPTS_SRC/kbn_dev_ctl.sh" "$INSTALL_DIR/kbn-dev-ctl"
+install_one "$SCRIPTS_SRC/kbn_dev.sh"     "$INSTALL_DIR/kbn-dev"     true
+install_one "$SCRIPTS_SRC/kbn_dev_ctl.sh" "$INSTALL_DIR/kbn-dev-ctl" true
 install_one "$SCRIPTS_SRC/kbn_dev_ccm.sh" "$INSTALL_DIR/kbn-dev-ccm"
 
 echo "  Installed: $INSTALL_DIR/kbn-dev"
@@ -150,9 +168,7 @@ echo "  Installed: $INSTALL_DIR/kbn-dev-ctl"
 echo "  Installed: $INSTALL_DIR/kbn-dev-ccm"
 
 # --- Create .env from template if it doesn't exist ------------------------
-KBN_DEV_HOME="${KBN_DEV_HOME:-$HOME/.kbn-dev}"
 mkdir -p "$KBN_DEV_HOME"
-ENV_FILE_PATH="$KBN_DEV_HOME/.env"
 
 if [ ! -f "$ENV_FILE_PATH" ] && [ -f "$KBN_DEV_SCRIPT_DIR/.env.dev" ]; then
   cp "$KBN_DEV_SCRIPT_DIR/.env.dev" "$ENV_FILE_PATH"
