@@ -7,7 +7,7 @@ CLOUD_API="https://cloud.elastic.co/api/v1"
 
 usage() {
   cat <<'EOF'
-Usage: set_ccm.sh --stack | --sls
+Usage: kbn-dev-ccm --stack | --sls
 
 Environment variables:
   CCM_API_KEY   CCM key (prod or QA). If unset, auto-fetches QA key from Vault.
@@ -17,11 +17,11 @@ Environment variables:
   VAULT_ADDR    Vault address (default: https://secrets.elastic.co:8200).
 
 Examples:
-  CCM_API_KEY=essu_...     ./set_ccm.sh --stack   # Prod key, stack
-  CCM_API_KEY=essu_...     ./set_ccm.sh --sls     # Prod key, serverless
-  CCM_API_KEY=essu_qa_...  ./set_ccm.sh --stack   # QA key, stack
-  ./set_ccm.sh --sls                               # Auto Vault QA key, sls
-  CCM_NO_EIS=1 ./set_ccm.sh --stack                # No EIS
+  CCM_API_KEY=essu_...     kbn-dev-ccm --stack   # Prod key, stack
+  CCM_API_KEY=essu_...     kbn-dev-ccm --sls     # Prod key, serverless
+  CCM_API_KEY=essu_qa_...  kbn-dev-ccm --stack   # QA key, stack
+  kbn-dev-ccm --sls                               # Auto Vault QA key, sls
+  CCM_NO_EIS=1 kbn-dev-ccm --stack                # No EIS
 EOF
   exit 1
 }

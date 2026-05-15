@@ -11,7 +11,7 @@
 #   git clone https://github.com/wildemat/kbn-dev-tools && cd kbn-dev-tools && ./install.sh
 #
 # What it does:
-#   1. Installs kbn-dev and kbn-dev-ctl to ~/.local/bin/ (added to PATH).
+#   1. Installs kbn-dev, kbn-dev-ctl, and kbn-dev-ccm to ~/.local/bin/ (added to PATH).
 #      - When run from a local checkout: symlinks (so repo edits go live).
 #      - When run via curl | sh: copies (the bootstrap tmpdir is ephemeral).
 #      - Override with KBN_DEV_INSTALL_MODE=copy or =symlink.
@@ -143,9 +143,11 @@ install_one() {
 
 install_one "$SCRIPTS_SRC/kbn_dev.sh" "$INSTALL_DIR/kbn-dev"
 install_one "$SCRIPTS_SRC/kbn_dev_ctl.sh" "$INSTALL_DIR/kbn-dev-ctl"
+install_one "$SCRIPTS_SRC/kbn_dev_ccm.sh" "$INSTALL_DIR/kbn-dev-ccm"
 
 echo "  Installed: $INSTALL_DIR/kbn-dev"
 echo "  Installed: $INSTALL_DIR/kbn-dev-ctl"
+echo "  Installed: $INSTALL_DIR/kbn-dev-ccm"
 
 # --- Create .env from template if it doesn't exist ------------------------
 KBN_DEV_HOME="${KBN_DEV_HOME:-$HOME/.kbn-dev}"
@@ -219,6 +221,7 @@ echo ""
 echo "  Commands:"
 echo "    kbn-dev            Start Kibana (serverless + stateful)"
 echo "    kbn-dev-ctl        Control plane (status, logs, restart, stop)"
+echo "    kbn-dev-ccm        Configure EIS/CCM on a running cluster"
 echo ""
 echo "  Usage (from your kibana repo root):"
 echo "    cd <your-kibana-repo>"

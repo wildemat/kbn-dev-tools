@@ -125,7 +125,7 @@ Wait and re-check. If it persists, restart.
 
 ### EIS / Vault failures
 
-**Symptom:** Vault access fails in non-interactive mode, or `node scripts/eis.js`
+**Symptom:** Vault access fails in non-interactive mode, or `kbn-dev-ccm`
 errors in the main log.
 
 **Fix:**

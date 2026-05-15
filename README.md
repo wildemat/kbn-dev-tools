@@ -24,7 +24,7 @@ cd kbn-dev-tools
 
 This installs:
 
-- `kbn-dev` and `kbn-dev-ctl` to `~/.local/bin/`
+- `kbn-dev`, `kbn-dev-ctl`, and `kbn-dev-ccm` to `~/.local/bin/`
 - Claude Code agent skills to `~/.claude/skills/` (and `~/.agents/skills/` if that directory already exists)
 
 ## Prerequisites
@@ -64,7 +64,7 @@ kbn-dev-ctl stop         # stop everything
 | Kibana SLS    | 5601 | Serverless Kibana                                        |
 | Kibana Stack  | 5611 | Stateful Kibana                                          |
 
-EIS runs automatically after each ES cluster is ready — it fetches a QA API key from Vault and pushes it to ES via `node scripts/eis.js`. See [Configuring EIS](#configuring-eis) to change this behaviour.
+EIS runs automatically after each ES cluster is ready — `kbn-dev` invokes `kbn-dev-ccm` with the appropriate target (`--sls` or `--stack`), which fetches a QA key from Vault and configures CCM. See [Configuring EIS](#configuring-eis) to change this behaviour.
 
 ## Claude Code / Cursor integration
 
@@ -108,7 +108,7 @@ All kbn-dev-specific variables use the `KBN_DEV_` prefix to avoid collisions wit
 | `KBN_DEV_ES_STACK_LICENSE`      | `trial`                                                | Stateful ES license (`basic` or `trial`).                    |
 | `KBN_DEV_ES_STACK_ML_ENABLED`   | `false`                                                | Enable ML on stateful ES (memory-heavy).                     |
 | `KBN_DEV_ES_STACK_EXTRA_ARGS`   | (none)                                                 | Additional args passed to `yarn es snapshot`.                |
-| `KIBANA_EIS_CCM_API_KEY`        | (none)                                                 | Use this EIS/CCM key directly — skips vault lookup and suppresses the `-E xpack.inference.elastic.url` flag on ES startup (prod keys use ES's built-in endpoint). |
+| `KIBANA_EIS_CCM_API_KEY`        | (none)                                                 | CCM key passed to `kbn-dev-ccm` as `CCM_API_KEY`. Skips vault. QA keys (`essu_qa_…`) or prod keys (`essu_…`) are both handled correctly — the key prefix determines which path `kbn-dev-ccm` takes. Supplying a prod key also suppresses the `-E xpack.inference.elastic.url` flag on ES startup. |
 | `KBN_USE_RSPACK`                | `true`                                                 | Use rspack optimizer. Set `false` to use legacy webpack.     |
 | `CHROME_BIN`                    | auto-detected                                          | Path to Chrome binary.                                       |
 | `SKIP_BROWSER_LAUNCH`           | (unset)                                                | Set to any value to skip Chrome launch.                      |
@@ -121,10 +121,10 @@ kbn-dev-tools/
 ├── README.md
 ├── .env.dev                # Default env var template (copied to ~/.kbn-dev/.env on install)
 ├── .env                    # Optional repo-local overrides for development (gitignored)
-├── set_ccm.sh              # Manual EIS/CCM setup helper (QA + prod, stack + serverless)
 ├── scripts/
 │   ├── kbn_dev.sh          # Orchestrator (starts everything)
-│   └── kbn_dev_ctl.sh      # Control plane (status/logs/restart/stop)
+│   ├── kbn_dev_ctl.sh      # Control plane (status/logs/restart/stop)
+│   └── kbn_dev_ccm.sh      # EIS/CCM setup (installed as kbn-dev-ccm; used internally by kbn-dev)
 └── skills/
     ├── kbn-dev/
     │   ├── SKILL.md         # Main agent skill
@@ -136,7 +136,7 @@ kbn-dev-tools/
 
 ## Configuring EIS
 
-EIS (Elastic Inference Service) runs automatically in **cloud-connected mode (CCM)**. After each ES cluster is ready, `kbn-dev` calls `node scripts/eis.js` in the Kibana repo to push a CCM key to ES so the inference endpoints work out of the box.
+EIS (Elastic Inference Service) runs automatically in **cloud-connected mode (CCM)**. After each ES cluster is ready, `kbn-dev` invokes `kbn-dev-ccm` (the same script you can run manually) with `CCM_API_KEY` and the appropriate `--sls` / `--stack` target. All EIS logic lives in `kbn-dev-ccm`.
 
 **Default behaviour — vault (QA key):**
 
@@ -148,11 +148,14 @@ VAULT_ADDR=https://secrets.elastic.co:8200 vault login --method oidc
 
 **Skip vault — use your own key:**
 
-Set `KIBANA_EIS_CCM_API_KEY` in `~/.kbn-dev/.env` to any valid CCM key. Vault is skipped entirely:
+Set `KIBANA_EIS_CCM_API_KEY` in `~/.kbn-dev/.env`. It is forwarded to `kbn-dev-ccm` as `CCM_API_KEY`. The key prefix determines the path taken:
 
 ```bash
-KIBANA_EIS_CCM_API_KEY=essu_...  # QA key (essu_qa_…) or prod key
+KIBANA_EIS_CCM_API_KEY=essu_qa_...   # QA key — direct _inference/_ccm PUT
+KIBANA_EIS_CCM_API_KEY=essu_...      # Prod key — Cloud API onboarding then key push
 ```
+
+Supplying a prod key also suppresses the `-E xpack.inference.elastic.url` flag on ES startup (the prod key carries its own endpoint routing).
 
 **Disable EIS:**
 
@@ -160,23 +163,23 @@ KIBANA_EIS_CCM_API_KEY=essu_...  # QA key (essu_qa_…) or prod key
 KBN_DEV_INFERENCE_URL=""
 ```
 
-**Manual EIS setup with `set_ccm.sh`:**
+**Manual EIS setup with `kbn-dev-ccm`:**
 
-`set_ccm.sh` is a standalone helper for pushing CCM keys outside of `kbn-dev` — useful when you need to re-configure EIS on a running cluster or use a prod key:
+`kbn-dev-ccm` (installed alongside `kbn-dev`) is the same script used internally — useful when you need to re-configure EIS on a running cluster:
 
 ```bash
 # Auto-fetch QA key from vault (serverless)
-./set_ccm.sh --sls
+kbn-dev-ccm --sls
 
 # Auto-fetch QA key from vault (stateful)
-./set_ccm.sh --stack
+kbn-dev-ccm --stack
 
 # Use your own key (prod or QA)
-CCM_API_KEY=essu_... ./set_ccm.sh --stack
-CCM_API_KEY=essu_qa_... ./set_ccm.sh --sls
+CCM_API_KEY=essu_... kbn-dev-ccm --stack
+CCM_API_KEY=essu_qa_... kbn-dev-ccm --sls
 
 # Skip EIS entirely
-CCM_NO_EIS=1 ./set_ccm.sh --stack
+CCM_NO_EIS=1 kbn-dev-ccm --stack
 ```
 
 The script detects whether the key is QA or prod from the `essu_qa_` prefix and takes the appropriate path (QA: direct `_inference/_ccm` PUT; prod: Cloud API onboarding then key push).

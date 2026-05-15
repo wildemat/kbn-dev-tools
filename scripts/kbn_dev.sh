@@ -17,7 +17,7 @@
 #   KBN_DEV_LOG_DIR              Log directory. Default: ~/.kbn-dev/logs
 #   KBN_DEV_INFERENCE_URL        EIS URL. Set to "" to disable.
 #                                Default: "https://inference.eu-west-1.aws.svc.qa.elastic.cloud"
-#   KIBANA_EIS_CCM_API_KEY       EIS API key (skips vault). For CI.
+#   KIBANA_EIS_CCM_API_KEY       CCM key passed to kbn-dev-ccm (skips vault). QA or prod.
 #   KBN_DEV_ES_SLS_PORT          Serverless ES HTTP port. Default: 9200
 #   KBN_DEV_ES_SLS_PROJECT_TYPE  Serverless project type. Default: elasticsearch_general_purpose
 #   KBN_DEV_ES_SLS_EXTRA_ARGS   Additional args for serverless ES.
@@ -1010,6 +1010,7 @@ run_es_to_kibana_pipeline() {
   local es_label="$1" es_log="$2" es_pid="$3" es_ready_pattern="$4"
   local kbn_label="$5" kbn_start_fn="$6" kbn_log="$7" kbn_pidfile="$8"
   local es_port="${9:-9200}"
+  local ccm_target="${10:---sls}"  # --sls or --stack
 
   log_step "Waiting for $es_label to be ready..."
   if ! wait_for_log "$es_log" "$es_ready_pattern" "$es_pid" "$es_label"; then
@@ -1024,7 +1025,10 @@ run_es_to_kibana_pipeline() {
     local eis_ok=false
     for eis_attempt in 1 2 3; do
       log_step "Running EIS setup for $es_label (attempt $eis_attempt/3, ES_PORT=$es_port)..."
-      if (cd "$KBN_DIR" && ES_PORT="$es_port" node scripts/eis.js) >> "$MAIN_LOG" 2>&1; then
+      if CCM_API_KEY="${KIBANA_EIS_CCM_API_KEY:-}" \
+         VAULT_ADDR="$EIS_VAULT_ADDR" \
+         ES_PORT="$es_port" \
+         kbn-dev-ccm "$ccm_target" >> "$MAIN_LOG" 2>&1; then
         eis_ok=true
         break
       fi
@@ -1045,14 +1049,14 @@ run_es_to_kibana_pipeline() {
 (
   run_es_to_kibana_pipeline \
     "ES Serverless" "$ESSLS_LOG" "$ESSLS_PID" "succ Serverless ES cluster running" \
-    "kbnsls" start_kbnsls "$KBNSLS_LOG" "$LOG_DIR/kbnsls.pid" "$KBN_DEV_ES_SLS_PORT"
+    "kbnsls" start_kbnsls "$KBNSLS_LOG" "$LOG_DIR/kbnsls.pid" "$KBN_DEV_ES_SLS_PORT" "--sls"
 ) &
 
 # Stateful pipeline (background)
 (
   run_es_to_kibana_pipeline \
     "ES Stateful" "$ESSTACK_LOG" "$ESSTACK_PID" "succ ES cluster is ready" \
-    "kbnstack" start_kbnstack "$KBNSTACK_LOG" "$LOG_DIR/kbnstack.pid" "$KBN_DEV_ES_STACK_PORT"
+    "kbnstack" start_kbnstack "$KBNSTACK_LOG" "$LOG_DIR/kbnstack.pid" "$KBN_DEV_ES_STACK_PORT" "--stack"
 ) &
 
 # =============================================================================
