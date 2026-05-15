@@ -3,7 +3,8 @@ set -euo pipefail
 
 EIS_QA_URL="https://inference.eu-west-1.aws.svc.qa.elastic.cloud"
 VAULT_SECRET="secret/kibana-issues/dev/inference/kibana-eis-ccm"
-CLOUD_API="https://cloud.elastic.co/api/v1"
+CLOUD_API_PROD="https://cloud.elastic.co/api/v1"
+CLOUD_API_QA="https://console.qa.cld.elstc.co/api/v1"
 
 usage() {
   cat <<'EOF'
@@ -13,7 +14,6 @@ Environment variables:
   CCM_API_KEY   CCM key (prod or QA). If unset, auto-fetches QA key from Vault.
   CCM_NO_EIS    Set to 1 to skip EIS setup entirely.
   ES_PORT       Override ES port (default: 9201 for stack, 9200 for sls).
-  KBN_PORT      Override Kibana port for stack (default: 5611).
   VAULT_ADDR    Vault address (default: https://secrets.elastic.co:8200).
 
 Examples:
@@ -117,6 +117,114 @@ fi
 echo "ES is up."
 
 # ==========================================================================
+# Cloud API onboarding flow — used by:
+#   - prod keys (always)
+#   - portal-generated QA keys (after the direct-push QA path returns 403)
+# Arg: $1 = Cloud API base URL (prod or QA)
+# Reads globals: API_KEY, ES_URL, ES_AUTH, CURL_ES_OPTS
+# Returns 0 on success, 1 on failure (no `exit`).
+# ==========================================================================
+
+do_cloud_api_onboard() {
+  local cloud_api="$1"
+  local cluster_info license_info cluster_uuid cluster_name cluster_version
+  local license_type license_uid onboard_response cc_cluster_id cc_key
+  local eis_already eis_response eis_key result_http attempt
+  local max_retries=5 retry_delay=3
+
+  echo ""
+  echo "==> Fetching cluster info..."
+  cluster_info=$(curl $CURL_ES_OPTS -u "$ES_AUTH" "$ES_URL")
+  license_info=$(curl $CURL_ES_OPTS -u "$ES_AUTH" "$ES_URL/_license")
+
+  cluster_uuid=$(echo "$cluster_info" | python3 -c "import sys,json; print(json.load(sys.stdin)['cluster_uuid'])")
+  cluster_name=$(echo "$cluster_info" | python3 -c "import sys,json; print(json.load(sys.stdin)['cluster_name'])")
+  cluster_version=$(echo "$cluster_info" | python3 -c "import sys,json; print(json.load(sys.stdin)['version']['number'])")
+  license_type=$(echo "$license_info" | python3 -c "import sys,json; print(json.load(sys.stdin)['license']['type'])")
+  license_uid=$(echo "$license_info" | python3 -c "import sys,json; print(json.load(sys.stdin)['license']['uid'])")
+
+  echo "Cluster: $cluster_uuid ($cluster_name) v$cluster_version — license: $license_type"
+
+  echo ""
+  echo "==> Onboarding cluster with Cloud API ($cloud_api)..."
+  onboard_response=$(curl -s -X POST "$cloud_api/cloud-connected/clusters?create_api_key=true" \
+    -H "Authorization: apiKey $API_KEY" \
+    -H "Content-Type: application/json" \
+    -d "{\"self_managed_cluster\": {\"id\": \"$cluster_uuid\", \"name\": \"$cluster_name\", \"version\": \"$cluster_version\"}, \"license\": {\"type\": \"$license_type\", \"uid\": \"$license_uid\"}}")
+
+  echo "$onboard_response" | python3 -m json.tool 2>/dev/null || echo "$onboard_response"
+
+  cc_cluster_id=$(echo "$onboard_response" | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])" 2>/dev/null) || {
+    echo "ERROR: Failed to onboard cluster."
+    return 1
+  }
+  cc_key=$(echo "$onboard_response" | python3 -c "import sys,json; print(json.load(sys.stdin)['key'])")
+
+  eis_already=$(echo "$onboard_response" | python3 -c "import sys,json; print(json.load(sys.stdin).get('services',{}).get('eis',{}).get('enabled',False))" 2>/dev/null || echo "False")
+  if [ "$eis_already" = "True" ]; then
+    echo ""
+    echo "EIS already enabled on Cloud API. Disabling first to get a fresh key..."
+    curl -s -X PATCH "$cloud_api/cloud-connected/clusters/$cc_cluster_id" \
+      -H "Authorization: apiKey $cc_key" \
+      -H "Content-Type: application/json" \
+      -d '{"services": {"eis": {"enabled": false}}}' > /dev/null
+    echo "Waiting for Cloud API to process..."
+    sleep 3
+  fi
+
+  echo ""
+  echo "==> Enabling EIS..."
+  eis_response=""
+  for attempt in $(seq 1 $max_retries); do
+    eis_response=$(curl -s -X PATCH "$cloud_api/cloud-connected/clusters/$cc_cluster_id" \
+      -H "Authorization: apiKey $cc_key" \
+      -H "Content-Type: application/json" \
+      -d '{"services": {"eis": {"enabled": true}}}')
+
+    if echo "$eis_response" | python3 -c "import sys,json; d=json.load(sys.stdin); sys.exit(0 if d.get('keys',{}).get('eis') else 1)" 2>/dev/null; then
+      break
+    fi
+
+    if [ "$attempt" -lt "$max_retries" ]; then
+      echo "Cloud API not ready (attempt $attempt/$max_retries), retrying in ${retry_delay}s..."
+      sleep $retry_delay
+    fi
+  done
+
+  echo "$eis_response" | python3 -m json.tool 2>/dev/null || echo "$eis_response"
+
+  eis_key=$(echo "$eis_response" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('keys',{}).get('eis',''))" 2>/dev/null || echo "")
+
+  if [ -z "$eis_key" ]; then
+    echo "ERROR: Cloud API did not return an EIS key."
+    return 1
+  fi
+
+  echo ""
+  echo "==> Pushing EIS key to ES..."
+  result_http=$(curl $CURL_ES_OPTS -o /dev/null -w "%{http_code}" -u "$ES_AUTH" -X PUT "$ES_URL/_inference/_ccm" \
+    -H "Content-Type: application/json" \
+    -d "{\"api_key\": \"$eis_key\"}")
+
+  if [[ "$result_http" -ge 200 && "$result_http" -lt 300 ]]; then
+    echo "Success (HTTP $result_http)."
+  else
+    echo "ERROR: PUT _inference/_ccm returned HTTP $result_http"
+    curl $CURL_ES_OPTS -u "$ES_AUTH" -X PUT "$ES_URL/_inference/_ccm" \
+      -H "Content-Type: application/json" \
+      -d "{\"api_key\": \"$eis_key\"}"
+    echo ""
+    return 1
+  fi
+
+  echo ""
+  echo "==> Verifying..."
+  curl $CURL_ES_OPTS -u "$ES_AUTH" "$ES_URL/_inference/_ccm"
+  echo ""
+  return 0
+}
+
+# ==========================================================================
 # QA PATH — same flow for both stack and sls
 # ==========================================================================
 
@@ -161,189 +269,60 @@ print(
     exit 0
   fi
 
-  # Push key
+  # Try direct push — works for Vault-provisioned keys that are pre-scoped
+  # for direct EIS validation. Portal-generated QA keys lack that scope and
+  # will 403 here; we fall back to the Cloud API onboarding flow below.
   echo ""
   echo "==> Pushing QA CCM key to ES..."
-  RESULT_HTTP=$(curl $CURL_ES_OPTS -o /dev/null -w "%{http_code}" -u "$ES_AUTH" -X PUT "$ES_URL/_inference/_ccm" \
+  RESPONSE_FILE=$(mktemp)
+  trap 'rm -f "$RESPONSE_FILE"' EXIT
+  RESULT_HTTP=$(curl $CURL_ES_OPTS -o "$RESPONSE_FILE" -w "%{http_code}" -u "$ES_AUTH" -X PUT "$ES_URL/_inference/_ccm" \
     -H "Content-Type: application/json" \
     -d "{\"api_key\": \"$API_KEY\"}")
+  RESPONSE_BODY=$(cat "$RESPONSE_FILE")
 
   if [[ "$RESULT_HTTP" -ge 200 && "$RESULT_HTTP" -lt 300 ]]; then
     echo "Success (HTTP $RESULT_HTTP)."
-  else
-    echo "ERROR: PUT _inference/_ccm returned HTTP $RESULT_HTTP"
-    curl $CURL_ES_OPTS -u "$ES_AUTH" -X PUT "$ES_URL/_inference/_ccm" \
-      -H "Content-Type: application/json" \
-      -d "{\"api_key\": \"$API_KEY\"}"
     echo ""
+    echo "==> Verifying..."
+    curl $CURL_ES_OPTS -u "$ES_AUTH" "$ES_URL/_inference/_ccm"
+    echo ""
+    echo ""
+    echo "Done (QA direct, $TARGET)."
+    exit 0
+  fi
+
+  echo "Direct push returned HTTP $RESULT_HTTP:"
+  echo "$RESPONSE_BODY"
+  echo ""
+
+  # 403 with the EIS auth-permission pattern => portal-generated key.
+  # Re-route through the QA Cloud API onboarding flow.
+  if [[ "$RESULT_HTTP" == "403" ]] && echo "$RESPONSE_BODY" | grep -qE 'authorization_request|API key does not have required permissions'; then
+    echo "Key lacks direct EIS permissions — looks like a portal-generated cluster key."
+    echo "Falling back to QA Cloud API onboarding flow..."
+    if do_cloud_api_onboard "$CLOUD_API_QA"; then
+      echo ""
+      echo "Done (QA via Cloud API onboarding, $TARGET)."
+      exit 0
+    fi
     exit 1
   fi
 
+  echo "ERROR: PUT _inference/_ccm failed (HTTP $RESULT_HTTP) and the error doesn't match the known portal-key 403 pattern."
+  exit 1
+fi
+
+# ==========================================================================
+# PROD PATH — Stack + Serverless (Cloud API onboarding + ES push)
+# ==========================================================================
+
+echo ""
+echo "--- Prod Path ($TARGET via Cloud API) ---"
+
+if do_cloud_api_onboard "$CLOUD_API_PROD"; then
   echo ""
-  echo "==> Verifying..."
-  curl $CURL_ES_OPTS -u "$ES_AUTH" "$ES_URL/_inference/_ccm"
-  echo ""
-  echo ""
-  echo "Done (QA, $TARGET)."
+  echo "Done (prod, $TARGET)."
   exit 0
 fi
-
-# ==========================================================================
-# PROD PATH — Stack (via Kibana Cloud Connect API)
-# ==========================================================================
-
-if [ "$TARGET" = "stack" ]; then
-  echo ""
-  echo "--- Prod Path (stack via Kibana) ---"
-
-  KBN_HOST="http://localhost:${KBN_PORT}"
-
-  # Auto-detect base path
-  REDIRECT_URL=$(curl -s -o /dev/null -w "%{redirect_url}" "$KBN_HOST/" 2>/dev/null || echo "")
-  BASE_PATH=$(echo "$REDIRECT_URL" | python3 -c "
-from urllib.parse import urlparse
-import sys
-p = urlparse(sys.stdin.read().strip()).path.rstrip('/')
-print(p if p else '')
-" 2>/dev/null || echo "")
-  KBN_URL="${KBN_HOST}${BASE_PATH}"
-  echo "Kibana: $KBN_URL"
-
-  KBN_HEADERS=(-H "Content-Type: application/json" -H "kbn-xsrf: true" -H "x-elastic-internal-origin: Kibana")
-
-  echo ""
-  echo "==> Disconnecting existing cluster (if any)..."
-  curl -s -u "$ES_AUTH" -X DELETE "$KBN_URL/internal/cloud_connect/cluster" \
-    "${KBN_HEADERS[@]}" > /dev/null 2>&1 || true
-
-  echo "==> Authenticating with Cloud Connect..."
-  AUTH_RESPONSE=$(curl -s -u "$ES_AUTH" -X POST "$KBN_URL/internal/cloud_connect/authenticate" \
-    "${KBN_HEADERS[@]}" \
-    -d "{\"apiKey\":\"$API_KEY\"}")
-
-  echo "$AUTH_RESPONSE" | python3 -m json.tool 2>/dev/null || echo "$AUTH_RESPONSE"
-
-  SUCCESS=$(echo "$AUTH_RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('success',''))" 2>/dev/null || echo "")
-  if [ "$SUCCESS" != "True" ]; then
-    echo "ERROR: Authentication failed."
-    exit 1
-  fi
-
-  echo ""
-  echo "==> Enabling EIS..."
-  EIS_RESPONSE=$(curl -s -u "$ES_AUTH" -X PUT "$KBN_URL/internal/cloud_connect/cluster_details" \
-    "${KBN_HEADERS[@]}" \
-    -d '{"services":{"eis":{"enabled":true}}}')
-
-  echo "$EIS_RESPONSE" | python3 -m json.tool 2>/dev/null || echo "$EIS_RESPONSE"
-
-  echo ""
-  echo "==> Verifying..."
-  curl -s -u "$ES_AUTH" "$ES_URL/_inference/_ccm"
-  echo ""
-  echo ""
-  echo "Done (prod, stack)."
-  exit 0
-fi
-
-# ==========================================================================
-# PROD PATH — Serverless (direct Cloud API + ES)
-# ==========================================================================
-
-echo ""
-echo "--- Prod Path (serverless via Cloud API) ---"
-
-echo ""
-echo "==> Fetching cluster info..."
-CLUSTER_INFO=$(curl $CURL_ES_OPTS -u "$ES_AUTH" "$ES_URL")
-LICENSE_INFO=$(curl $CURL_ES_OPTS -u "$ES_AUTH" "$ES_URL/_license")
-
-CLUSTER_UUID=$(echo "$CLUSTER_INFO" | python3 -c "import sys,json; print(json.load(sys.stdin)['cluster_uuid'])")
-CLUSTER_NAME=$(echo "$CLUSTER_INFO" | python3 -c "import sys,json; print(json.load(sys.stdin)['cluster_name'])")
-CLUSTER_VERSION=$(echo "$CLUSTER_INFO" | python3 -c "import sys,json; print(json.load(sys.stdin)['version']['number'])")
-LICENSE_TYPE=$(echo "$LICENSE_INFO" | python3 -c "import sys,json; print(json.load(sys.stdin)['license']['type'])")
-LICENSE_UID=$(echo "$LICENSE_INFO" | python3 -c "import sys,json; print(json.load(sys.stdin)['license']['uid'])")
-
-echo "Cluster: $CLUSTER_UUID ($CLUSTER_NAME) v$CLUSTER_VERSION — license: $LICENSE_TYPE"
-
-echo ""
-echo "==> Onboarding cluster with Cloud API..."
-ONBOARD_RESPONSE=$(curl -s -X POST "$CLOUD_API/cloud-connected/clusters?create_api_key=true" \
-  -H "Authorization: apiKey $API_KEY" \
-  -H "Content-Type: application/json" \
-  -d "{\"self_managed_cluster\": {\"id\": \"$CLUSTER_UUID\", \"name\": \"$CLUSTER_NAME\", \"version\": \"$CLUSTER_VERSION\"}, \"license\": {\"type\": \"$LICENSE_TYPE\", \"uid\": \"$LICENSE_UID\"}}")
-
-echo "$ONBOARD_RESPONSE" | python3 -m json.tool 2>/dev/null || echo "$ONBOARD_RESPONSE"
-
-CC_CLUSTER_ID=$(echo "$ONBOARD_RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])" 2>/dev/null) || {
-  echo "ERROR: Failed to onboard cluster."
-  exit 1
-}
-CC_KEY=$(echo "$ONBOARD_RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin)['key'])")
-
-# If EIS is already enabled on the Cloud API side, disable first to get a fresh key
-EIS_ALREADY=$(echo "$ONBOARD_RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('services',{}).get('eis',{}).get('enabled',False))" 2>/dev/null || echo "False")
-if [ "$EIS_ALREADY" = "True" ]; then
-  echo ""
-  echo "EIS already enabled on Cloud API. Disabling first to get a fresh key..."
-  curl -s -X PATCH "$CLOUD_API/cloud-connected/clusters/$CC_CLUSTER_ID" \
-    -H "Authorization: apiKey $CC_KEY" \
-    -H "Content-Type: application/json" \
-    -d '{"services": {"eis": {"enabled": false}}}' > /dev/null
-  echo "Waiting for Cloud API to process..."
-  sleep 3
-fi
-
-echo ""
-echo "==> Enabling EIS..."
-MAX_RETRIES=5
-RETRY_DELAY=3
-EIS_RESPONSE=""
-for attempt in $(seq 1 $MAX_RETRIES); do
-  EIS_RESPONSE=$(curl -s -X PATCH "$CLOUD_API/cloud-connected/clusters/$CC_CLUSTER_ID" \
-    -H "Authorization: apiKey $CC_KEY" \
-    -H "Content-Type: application/json" \
-    -d '{"services": {"eis": {"enabled": true}}}')
-
-  if echo "$EIS_RESPONSE" | python3 -c "import sys,json; d=json.load(sys.stdin); sys.exit(0 if d.get('keys',{}).get('eis') else 1)" 2>/dev/null; then
-    break
-  fi
-
-  if [ "$attempt" -lt "$MAX_RETRIES" ]; then
-    echo "Cloud API not ready (attempt $attempt/$MAX_RETRIES), retrying in ${RETRY_DELAY}s..."
-    sleep $RETRY_DELAY
-  fi
-done
-
-echo "$EIS_RESPONSE" | python3 -m json.tool 2>/dev/null || echo "$EIS_RESPONSE"
-
-EIS_KEY=$(echo "$EIS_RESPONSE" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('keys',{}).get('eis',''))" 2>/dev/null || echo "")
-
-if [ -z "$EIS_KEY" ]; then
-  echo "ERROR: Cloud API did not return an EIS key."
-  exit 1
-fi
-
-echo ""
-echo "==> Pushing EIS key to ES..."
-RESULT_HTTP=$(curl $CURL_ES_OPTS -o /dev/null -w "%{http_code}" -u "$ES_AUTH" -X PUT "$ES_URL/_inference/_ccm" \
-  -H "Content-Type: application/json" \
-  -d "{\"api_key\": \"$EIS_KEY\"}")
-
-if [[ "$RESULT_HTTP" -ge 200 && "$RESULT_HTTP" -lt 300 ]]; then
-  echo "Success (HTTP $RESULT_HTTP)."
-else
-  echo "ERROR: PUT _inference/_ccm returned HTTP $RESULT_HTTP"
-  curl $CURL_ES_OPTS -u "$ES_AUTH" -X PUT "$ES_URL/_inference/_ccm" \
-    -H "Content-Type: application/json" \
-    -d "{\"api_key\": \"$EIS_KEY\"}"
-  echo ""
-  exit 1
-fi
-
-echo ""
-echo "==> Verifying..."
-curl $CURL_ES_OPTS -u "$ES_AUTH" "$ES_URL/_inference/_ccm"
-echo ""
-echo ""
-echo "Done (prod, serverless)."
+exit 1

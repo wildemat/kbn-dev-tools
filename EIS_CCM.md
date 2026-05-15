@@ -12,16 +12,17 @@ Elastic's cloud infrastructure. To use EIS from a local cluster you must configu
 CCM — a trust relationship between the local ES cluster and the cloud, established
 by pushing a CCM API key to ES via `PUT /_inference/_ccm`.
 
-There are two kinds of CCM key:
+CCM keys come in three flavors:
 
-| Key prefix  | Source                       | Notes                                              |
-| ----------- | ---------------------------- | -------------------------------------------------- |
-| `essu_qa_…` | Vault (`kibana-eis-ccm`)     | Points to the QA inference endpoint; for dev only  |
-| `essu_…`    | Elastic Cloud portal (prod)  | Points to your own cloud org's inference endpoint  |
+| Key prefix  | Source                                              | Scope                       | Flow                                          |
+| ----------- | --------------------------------------------------- | --------------------------- | --------------------------------------------- |
+| `essu_qa_…` | Vault (`kibana-eis-ccm`)                            | Direct EIS (pre-scoped)     | QA: `PUT /_inference/_ccm` directly           |
+| `essu_qa_…` | QA cloud portal (`console.qa.cld.elstc.co`)         | Cluster onboarding only     | QA: fall back to QA Cloud API onboarding flow |
+| `essu_…`    | Prod cloud portal (`cloud.elastic.co`)              | Cluster onboarding only     | Prod: Cloud API onboarding flow               |
 
-The QA path requires ES to be started with `-E xpack.inference.elastic.url=<QA_URL>`.
-The prod path configures the inference URL through the Cloud API or Kibana, so no
-extra ES flags are needed.
+The QA paths require ES to be started with `-E xpack.inference.elastic.url=<QA_URL>`.
+The prod path receives the inference URL from the Cloud API onboarding response, so
+no ES flags are needed.
 
 ---
 
@@ -105,54 +106,46 @@ CCM_API_KEY unset            ─────────────────
       │                │
   key prefix?    CCM_NO_EIS=1?
    essu_qa_…   ──────┤Yes──► exit
-   essu_…      │     └No───► fetch from Vault
-      │         │                  │
-      ▼         ▼                  ▼
-   Prod path   (see below)     QA path
-      │
-  ┌───┴───┐
---stack  --sls
-  │        │
-  ▼        ▼
-Kibana   Cloud API
-Cloud    + direct
-Connect  ES push
+   essu_…      │     └No───► fetch from Vault → QA path
+      │         │
+      ▼         ▼
+   Prod      QA path
+   path     (direct PUT;
+      │     on 403 fall back
+      │     to QA Cloud API
+      │     onboarding flow)
+      ▼
+   Cloud API onboarding
+   (prod URL) + ES push
 ```
 
 ### QA path (both --stack and --sls)
 
-The QA path is identical for both targets:
+Same flow for both targets, with auto-fallback for portal-generated keys:
 
 1. Verify ES is reachable
 2. Check `xpack.inference.elastic.url` is configured on ES — warn and exit if not
    (ES must be started with `-E xpack.inference.elastic.url=<QA_URL>`)
 3. Check `GET /_inference/_ccm` — skip if CCM is already enabled
-4. `PUT /_inference/_ccm` with the QA key
-5. Verify
+4. **Try direct push:** `PUT /_inference/_ccm` with the key
+5. If the response is HTTP 403 with the `authorization_request` / "API key does not
+   have required permissions" pattern, the key is a portal-generated cluster key
+   (not a pre-scoped Vault key). Fall back to **QA Cloud API onboarding**:
+   - Onboard the cluster via `POST https://console.qa.cld.elstc.co/api/v1/cloud-connected/clusters`
+   - `PATCH /cloud-connected/clusters/{id}` to enable EIS — receives a scoped EIS key
+   - `PUT /_inference/_ccm` with that EIS key
+6. Verify
 
 Default QA inference URL: `https://inference.eu-west-1.aws.svc.qa.elastic.cloud`
+QA Cloud API URL: `https://console.qa.cld.elstc.co/api/v1`
 
-### Prod path — stateful (--stack)
+### Prod path (both --stack and --sls)
 
-Uses Kibana's internal Cloud Connect API so Kibana handles the full authentication
-flow rather than hitting the Cloud API directly:
-
-1. Auto-detect Kibana base path from redirect response
-2. `DELETE /internal/cloud_connect/cluster` — disconnect any existing cluster
-3. `POST /internal/cloud_connect/authenticate` with the prod key
-4. `PUT /internal/cloud_connect/cluster_details` — enable EIS service
-5. `GET /_inference/_ccm` — verify
-
-Kibana must be running at `http://localhost:<KBN_PORT>` (default `5611`).
-
-### Prod path — serverless (--sls)
-
-Goes directly through the Elastic Cloud API because the serverless local cluster
-doesn't run a Kibana that has Cloud Connect enabled:
+Both targets use the same Cloud API onboarding flow:
 
 1. Gather cluster info from ES (`cluster_uuid`, `cluster_name`, version, license uid)
-2. `POST /cloud-connected/clusters?create_api_key=true` — onboard cluster, receive
-   a cluster-scoped `keys.eis` key
+2. `POST https://cloud.elastic.co/api/v1/cloud-connected/clusters?create_api_key=true`
+   — onboard cluster, receive a cluster-scoped key
 3. If EIS was already enabled, disable it first to force a fresh key
 4. `PATCH /cloud-connected/clusters/{id}` — enable EIS (with retries)
 5. `PUT /_inference/_ccm` — push the returned `keys.eis` to local ES
@@ -167,7 +160,7 @@ doesn't run a Kibana that has Cloud Connect enabled:
 | Variable                 | Default                                                | Effect                                                    |
 | ------------------------ | ------------------------------------------------------ | --------------------------------------------------------- |
 | `KBN_DEV_INFERENCE_URL`  | `https://inference.eu-west-1.aws.svc.qa.elastic.cloud` | QA inference URL passed to ES via `-E`. Set `""` to disable EIS entirely. |
-| `KIBANA_EIS_CCM_API_KEY` | (none)                                                 | Forwarded to `kbn-dev-ccm` as `CCM_API_KEY`. Skips vault. Key prefix (`essu_qa_…` vs `essu_…`) determines QA vs prod path. A prod key also suppresses the `-E` inference URL flag on ES startup. |
+| `KIBANA_EIS_CCM_API_KEY` | (none)                                                 | Forwarded to `kbn-dev-ccm` as `CCM_API_KEY`. Skips vault. Key prefix (`essu_qa_…` vs `essu_…`) determines QA vs prod path. Only **prod** keys (`essu_…` excluding `essu_qa_…`) suppress the `-E` inference URL flag on ES startup; QA keys (Vault or portal) still get the inference URL passed to ES. |
 
 ### kbn-dev-ccm
 
@@ -176,7 +169,6 @@ doesn't run a Kibana that has Cloud Connect enabled:
 | `CCM_API_KEY` | (none — auto-fetch from Vault)       | The CCM key to use. Prefix determines QA vs prod path.       |
 | `CCM_NO_EIS`  | (unset)                              | Set to `1` to exit immediately without configuring EIS.      |
 | `ES_PORT`     | `9201` (stack) / `9200` (sls)        | Override the ES port.                                        |
-| `KBN_PORT`    | `5611`                               | Override the Kibana port (prod stack path only).             |
 | `VAULT_ADDR`  | `https://secrets.elastic.co:8200`    | Override the Vault address.                                  |
 
 > **Note:** `kbn-dev` uses `KIBANA_EIS_CCM_API_KEY` (the standard Kibana env var name)

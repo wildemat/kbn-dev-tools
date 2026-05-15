@@ -544,12 +544,16 @@ CCM_ENABLED=false
 INFERENCE_FLAG=""
 if [ -n "$KBN_DEV_INFERENCE_URL" ]; then
   CCM_ENABLED=true
-  # Only pass the QA inference URL to ES when the user hasn't provided their
-  # own CCM key.  A user-supplied KIBANA_EIS_CCM_API_KEY means they connect to
-  # their own cloud EIS endpoint and the default QA URL would conflict.
-  if [ -z "${KIBANA_EIS_CCM_API_KEY:-}" ]; then
+  # Skip the QA inference URL only for prod CCM keys (essu_* but not essu_qa_*).
+  # Prod keys connect to their own cloud EIS endpoint so the QA URL would conflict.
+  # QA keys (essu_qa_*) and Vault-fetched keys still need the inference URL on ES.
+  _ccm_key="${KIBANA_EIS_CCM_API_KEY:-}"
+  if [[ "$_ccm_key" == essu_* ]] && [[ "$_ccm_key" != essu_qa_* ]]; then
+    INFERENCE_FLAG=""
+  else
     INFERENCE_FLAG="-E xpack.inference.elastic.url=$KBN_DEV_INFERENCE_URL"
   fi
+  unset _ccm_key
 fi
 
 # --- ES cluster overrides ---------------------------------------------------

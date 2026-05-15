@@ -108,7 +108,7 @@ All kbn-dev-specific variables use the `KBN_DEV_` prefix to avoid collisions wit
 | `KBN_DEV_ES_STACK_LICENSE`      | `trial`                                                | Stateful ES license (`basic` or `trial`).                    |
 | `KBN_DEV_ES_STACK_ML_ENABLED`   | `false`                                                | Enable ML on stateful ES (memory-heavy).                     |
 | `KBN_DEV_ES_STACK_EXTRA_ARGS`   | (none)                                                 | Additional args passed to `yarn es snapshot`.                |
-| `KIBANA_EIS_CCM_API_KEY`        | (none)                                                 | CCM key passed to `kbn-dev-ccm` as `CCM_API_KEY`. Skips vault. QA keys (`essu_qa_…`) or prod keys (`essu_…`) are both handled correctly — the key prefix determines which path `kbn-dev-ccm` takes. Supplying a prod key also suppresses the `-E xpack.inference.elastic.url` flag on ES startup. |
+| `KIBANA_EIS_CCM_API_KEY`        | (none)                                                 | CCM key passed to `kbn-dev-ccm` as `CCM_API_KEY`. Skips vault. QA keys (`essu_qa_…`, Vault or QA portal) and prod keys (`essu_…`) are all handled — the key prefix determines the path. Only **prod** keys (`essu_…` excluding `essu_qa_…`) suppress the `-E xpack.inference.elastic.url` flag on ES startup; QA keys still need it. |
 | `KBN_USE_RSPACK`                | `true`                                                 | Use rspack optimizer. Set `false` to use legacy webpack.     |
 | `CHROME_BIN`                    | auto-detected                                          | Path to Chrome binary.                                       |
 | `SKIP_BROWSER_LAUNCH`           | (unset)                                                | Set to any value to skip Chrome launch.                      |
@@ -151,11 +151,13 @@ VAULT_ADDR=https://secrets.elastic.co:8200 vault login --method oidc
 Set `KIBANA_EIS_CCM_API_KEY` in `~/.kbn-dev/.env`. It is forwarded to `kbn-dev-ccm` as `CCM_API_KEY`. The key prefix determines the path taken:
 
 ```bash
-KIBANA_EIS_CCM_API_KEY=essu_qa_...   # QA key — direct _inference/_ccm PUT
-KIBANA_EIS_CCM_API_KEY=essu_...      # Prod key — Cloud API onboarding then key push
+KIBANA_EIS_CCM_API_KEY=essu_qa_...   # QA key (Vault or QA portal). Tries direct
+                                     # _inference/_ccm PUT; on 403 falls back to
+                                     # QA Cloud API onboarding (for portal keys).
+KIBANA_EIS_CCM_API_KEY=essu_...      # Prod key — prod Cloud API onboarding, then ES push.
 ```
 
-Supplying a prod key also suppresses the `-E xpack.inference.elastic.url` flag on ES startup (the prod key carries its own endpoint routing).
+Only **prod** keys suppress the `-E xpack.inference.elastic.url` flag on ES startup (the prod key carries its own endpoint routing). QA keys — whether from Vault or the QA portal — still need the QA inference URL set on ES.
 
 **Disable EIS:**
 
@@ -182,4 +184,8 @@ CCM_API_KEY=essu_qa_... kbn-dev-ccm --sls
 CCM_NO_EIS=1 kbn-dev-ccm --stack
 ```
 
-The script detects whether the key is QA or prod from the `essu_qa_` prefix and takes the appropriate path (QA: direct `_inference/_ccm` PUT; prod: Cloud API onboarding then key push).
+The script detects whether the key is QA or prod from the `essu_qa_` prefix and takes the appropriate path:
+- **QA path** — tries a direct `_inference/_ccm` PUT first (Vault-provisioned keys succeed here). On HTTP 403 with the "API key does not have required permissions" pattern, it falls back to the QA Cloud API onboarding flow (for keys generated via `console.qa.cld.elstc.co/connect-cluster-services-portal`).
+- **Prod path** — Cloud API onboarding against `cloud.elastic.co/api/v1`, then push the resulting EIS key to ES.
+
+See [EIS_CCM.md](EIS_CCM.md) for a full description of the three CCM key types and their flows.
