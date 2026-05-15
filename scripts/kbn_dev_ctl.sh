@@ -467,6 +467,12 @@ restart_full() {
 }
 
 cmd_restart() {
+  if [ -f "$KBN_DEV_ENV_FILE" ]; then
+    echo "kbn-dev-ctl: using env file $KBN_DEV_ENV_FILE"
+  else
+    echo "kbn-dev-ctl: no env file at $KBN_DEV_ENV_FILE (using defaults)"
+  fi
+
   local comp="${1:-}"
   shift || true
   local kibana_only=false

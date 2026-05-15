@@ -73,6 +73,9 @@ fi
 if [ -f "$KBN_DEV_ENV_FILE" ]; then
   # shellcheck disable=SC1090
   set -a; . "$KBN_DEV_ENV_FILE"; set +a
+  echo "kbn-dev: using env file $KBN_DEV_ENV_FILE"
+else
+  echo "kbn-dev: no env file at $KBN_DEV_ENV_FILE (using defaults)"
 fi
 
 # =============================================================================
