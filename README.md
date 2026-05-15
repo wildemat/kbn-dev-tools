@@ -55,13 +55,16 @@ kbn-dev-ctl stop         # stop everything
 
 ## What it starts
 
-| Component     | Port | Description                     |
-| ------------- | ---- | ------------------------------- |
-| ES Serverless | 9200 | Docker-based serverless cluster |
-| ES Stateful   | 9201 | Snapshot-based trial cluster    |
-| Optimizer     | —    | Shared plugin builder (watch)   |
-| Kibana SLS    | 5601 | Serverless Kibana               |
-| Kibana Stack  | 5611 | Stateful Kibana                 |
+| Component     | Port | Description                                              |
+| ------------- | ---- | -------------------------------------------------------- |
+| ES Serverless | 9200 | Docker-based serverless cluster                          |
+| ES Stateful   | 9201 | Snapshot-based trial cluster                             |
+| EIS           | —    | Elastic Inference Service (cloud-connected mode via CCM) |
+| Optimizer     | —    | Shared plugin builder (watch, rspack by default)         |
+| Kibana SLS    | 5601 | Serverless Kibana                                        |
+| Kibana Stack  | 5611 | Stateful Kibana                                          |
+
+EIS runs automatically after each ES cluster is ready — it fetches a QA API key from Vault and pushes it to ES via `node scripts/eis.js`. See [Configuring EIS](#configuring-eis) to change this behaviour.
 
 ## Claude Code / Cursor integration
 
@@ -94,18 +97,21 @@ Installs via `curl | sh` always **copy** the scripts (the bootstrap tmpdir disap
 
 All kbn-dev-specific variables use the `KBN_DEV_` prefix to avoid collisions with Kibana or Elasticsearch env vars.
 
-| Variable                        | Default                                                | Purpose                                   |
-| ------------------------------- | ------------------------------------------------------ | ----------------------------------------- |
-| `KBN_DEV_INFERENCE_URL`         | `https://inference.eu-west-1.aws.svc.qa.elastic.cloud` | EIS URL. Set `""` to disable.             |
-| `KBN_DEV_LOG_DIR`               | `~/.kbn-dev/logs`                                      | Log file directory.                       |
-| `KBN_DEV_ES_SLS_PROJECT_TYPE`   | `elasticsearch_general_purpose`                        | Serverless ES project type.               |
-| `KBN_DEV_ES_SLS_EXTRA_ARGS`    | (none)                                                 | Additional args for serverless ES.        |
-| `KBN_DEV_ES_STACK_LICENSE`      | `trial`                                                | Stateful ES license (`basic` or `trial`). |
-| `KBN_DEV_ES_STACK_ML_ENABLED`   | `false`                                                | Enable ML on stateful ES (memory-heavy).  |
-| `KBN_DEV_ES_STACK_EXTRA_ARGS`   | (none)                                                 | Additional args for stateful ES.          |
-| `KIBANA_EIS_CCM_API_KEY`        | (none)                                                 | Skip vault, use EIS key directly.         |
-| `CHROME_BIN`                    | auto-detected                                          | Path to Chrome binary.                    |
-| `SKIP_BROWSER_LAUNCH`           | (unset)                                                | Set to skip Chrome launch.                |
+| Variable                        | Default                                                | Purpose                                                      |
+| ------------------------------- | ------------------------------------------------------ | ------------------------------------------------------------ |
+| `KBN_DEV_INFERENCE_URL`         | `https://inference.eu-west-1.aws.svc.qa.elastic.cloud` | EIS URL passed to ES. Set `""` to disable EIS entirely.      |
+| `KBN_DEV_LOG_DIR`               | `~/.kbn-dev/logs`                                      | Log file directory.                                          |
+| `KBN_DEV_ES_SLS_PORT`           | `9200`                                                 | Serverless ES HTTP port (transport = port + 100).            |
+| `KBN_DEV_ES_SLS_PROJECT_TYPE`   | `elasticsearch_general_purpose`                        | Serverless project type (`elasticsearch_general_purpose`, `observability`, `security`). |
+| `KBN_DEV_ES_SLS_EXTRA_ARGS`     | (none)                                                 | Additional args passed to `yarn es serverless`.              |
+| `KBN_DEV_ES_STACK_PORT`         | `9201`                                                 | Stateful ES HTTP port (transport = port + 100).              |
+| `KBN_DEV_ES_STACK_LICENSE`      | `trial`                                                | Stateful ES license (`basic` or `trial`).                    |
+| `KBN_DEV_ES_STACK_ML_ENABLED`   | `false`                                                | Enable ML on stateful ES (memory-heavy).                     |
+| `KBN_DEV_ES_STACK_EXTRA_ARGS`   | (none)                                                 | Additional args passed to `yarn es snapshot`.                |
+| `KIBANA_EIS_CCM_API_KEY`        | (none)                                                 | Use this EIS/CCM key directly — skips vault lookup and suppresses the `-E xpack.inference.elastic.url` flag on ES startup (prod keys use ES's built-in endpoint). |
+| `KBN_USE_RSPACK`                | `true`                                                 | Use rspack optimizer. Set `false` to use legacy webpack.     |
+| `CHROME_BIN`                    | auto-detected                                          | Path to Chrome binary.                                       |
+| `SKIP_BROWSER_LAUNCH`           | (unset)                                                | Set to any value to skip Chrome launch.                      |
 
 ## File structure
 
@@ -115,6 +121,7 @@ kbn-dev-tools/
 ├── README.md
 ├── .env.dev                # Default env var template (copied to ~/.kbn-dev/.env on install)
 ├── .env                    # Optional repo-local overrides for development (gitignored)
+├── set_ccm.sh              # Manual EIS/CCM setup helper (QA + prod, stack + serverless)
 ├── scripts/
 │   ├── kbn_dev.sh          # Orchestrator (starts everything)
 │   └── kbn_dev_ctl.sh      # Control plane (status/logs/restart/stop)
@@ -126,3 +133,50 @@ kbn-dev-tools/
     └── kbn-dev-status/
         └── SKILL.md         # Lightweight status-only skill
 ```
+
+## Configuring EIS
+
+EIS (Elastic Inference Service) runs automatically in **cloud-connected mode (CCM)**. After each ES cluster is ready, `kbn-dev` calls `node scripts/eis.js` in the Kibana repo to push a CCM key to ES so the inference endpoints work out of the box.
+
+**Default behaviour — vault (QA key):**
+
+No configuration needed. `kbn-dev` checks vault access upfront and prompts you to log in if your token has expired:
+
+```bash
+VAULT_ADDR=https://secrets.elastic.co:8200 vault login --method oidc
+```
+
+**Skip vault — use your own key:**
+
+Set `KIBANA_EIS_CCM_API_KEY` in `~/.kbn-dev/.env` to any valid CCM key. Vault is skipped entirely:
+
+```bash
+KIBANA_EIS_CCM_API_KEY=essu_...  # QA key (essu_qa_…) or prod key
+```
+
+**Disable EIS:**
+
+```bash
+KBN_DEV_INFERENCE_URL=""
+```
+
+**Manual EIS setup with `set_ccm.sh`:**
+
+`set_ccm.sh` is a standalone helper for pushing CCM keys outside of `kbn-dev` — useful when you need to re-configure EIS on a running cluster or use a prod key:
+
+```bash
+# Auto-fetch QA key from vault (serverless)
+./set_ccm.sh --sls
+
+# Auto-fetch QA key from vault (stateful)
+./set_ccm.sh --stack
+
+# Use your own key (prod or QA)
+CCM_API_KEY=essu_... ./set_ccm.sh --stack
+CCM_API_KEY=essu_qa_... ./set_ccm.sh --sls
+
+# Skip EIS entirely
+CCM_NO_EIS=1 ./set_ccm.sh --stack
+```
+
+The script detects whether the key is QA or prod from the `essu_qa_` prefix and takes the appropriate path (QA: direct `_inference/_ccm` PUT; prod: Cloud API onboarding then key push).
