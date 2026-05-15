@@ -4,10 +4,20 @@ One-command installer for the Kibana dual-mode dev environment. Spins up
 **serverless** (`:5601`) and **stateful** (`:5611`) Kibana instances in
 parallel with shared optimizer and EIS via cloud connected mode.
 
+> **Not what you're looking for?** If you just want to try Elasticsearch and Kibana locally without a source checkout, use [elastic/start-local](https://github.com/elastic/start-local) — a one-liner that pulls released Docker images with no repo required.
+>
+> This repo is for **Kibana developers** who need to run both Kibana modes simultaneously from source, with an optimizer, vault-backed EIS, and Claude Code agent skills for dev workflow automation.
+
 ## Quick install
 
 ```bash
-git clone https://github.com/<org>/kbn-dev-tools
+curl -fsSL https://raw.githubusercontent.com/wildemat/kbn-dev-tools/main/install.sh | bash
+```
+
+Or clone and run locally:
+
+```bash
+git clone https://github.com/wildemat/kbn-dev-tools
 cd kbn-dev-tools
 ./install.sh
 ```
@@ -15,7 +25,7 @@ cd kbn-dev-tools
 This installs:
 
 - `kbn-dev` and `kbn-dev-ctl` to `~/.local/bin/`
-- Claude Code agent skills to `~/.claude/skills/` and `~/.agents/skills/`
+- Claude Code agent skills to `~/.claude/skills/` (and `~/.agents/skills/` if that directory already exists)
 
 ## Prerequisites
 

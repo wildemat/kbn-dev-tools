@@ -6,13 +6,13 @@
 # managing a local Kibana dual-mode dev environment (serverless + stateful).
 #
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/<org>/kbn-dev-tools/main/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/wildemat/kbn-dev-tools/main/install.sh | bash
 #   # or
-#   git clone https://github.com/<org>/kbn-dev-tools && cd kbn-dev-tools && ./install.sh
+#   git clone https://github.com/wildemat/kbn-dev-tools && cd kbn-dev-tools && ./install.sh
 #
 # What it does:
 #   1. Copies kbn-dev and kbn-dev-ctl to ~/.local/bin/ (added to PATH)
-#   2. Installs Claude Code agent skills to ~/.claude/skills/ and ~/.agents/skills/
+#   2. Installs Claude Code agent skills to ~/.claude/skills/ (and ~/.agents/skills/ if it exists)
 #   3. Verifies prerequisites (Docker; optionally a node version manager)
 #
 # Prerequisites:
@@ -23,6 +23,20 @@
 # ---------------------------------------------------------------------------
 
 set -euo pipefail
+
+REPO="wildemat/kbn-dev-tools"
+BRANCH="main"
+
+# When run via curl | sh, $0 is "bash" and there are no local files.
+# Bootstrap by downloading the repo tarball and re-executing from there.
+if [ ! -f "$(dirname "$0")/scripts/kbn_dev.sh" ] && [ ! -f "$(dirname "$0")/kbn_dev.sh" ]; then
+  echo "Downloading kbn-dev-tools..."
+  _tmpdir="$(mktemp -d)"
+  trap 'rm -rf "$_tmpdir"' EXIT
+  curl -fsSL "https://github.com/$REPO/archive/refs/heads/$BRANCH.tar.gz" \
+    | tar -xz -C "$_tmpdir" --strip-components=1
+  exec bash "$_tmpdir/install.sh" "$@"
+fi
 
 INSTALL_DIR="${KBN_DEV_TOOLS_DIR:-$HOME/.local/bin}"
 KBN_DEV_SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
