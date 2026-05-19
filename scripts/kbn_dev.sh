@@ -629,7 +629,11 @@ setup_eis_vault() {
     echo ""
     echo "    VAULT_ADDR=$EIS_VAULT_ADDR vault login -method oidc"
     echo ""
-    read -r -p "  Press Enter after logging in to retry (or Ctrl+C to abort)... "
+    read -r -p "  Press Enter to run vault login now (or Ctrl+C to abort)... "
+    echo ""
+    VAULT_ADDR="$EIS_VAULT_ADDR" vault login -method oidc
+    echo ""
+    read -r -p "  Press Enter to retry vault check... "
     echo ""
   done
   echo ""
