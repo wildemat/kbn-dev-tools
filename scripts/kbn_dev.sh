@@ -144,6 +144,21 @@ wait_for_kibana() {
   done
 }
 
+check_docker_auth_error() {
+  local logfile="$1"
+  if grep -q "authenticating with docker.elastic.co\|docker-auth.elastic.co" "$logfile" 2>/dev/null; then
+    echo ""
+    echo "  !! Docker registry auth failure !!"
+    echo "  Your docker.elastic.co session has expired or is missing."
+    echo "  1. Visit https://docker-auth.elastic.co/github_auth"
+    echo "  2. Run: docker login docker.elastic.co"
+    echo "  3. Then: kbn-dev-ctl restart serverless"
+    echo ""
+    return 0
+  fi
+  return 1
+}
+
 kill_tree() {
   local pid="$1"
   if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
@@ -1023,6 +1038,7 @@ run_es_to_kibana_pipeline() {
 
   log_step "Waiting for $es_label to be ready..."
   if ! wait_for_log "$es_log" "$es_ready_pattern" "$es_pid" "$es_label"; then
+    check_docker_auth_error "$es_log"
     return 1
   fi
 
@@ -1132,6 +1148,7 @@ if [ "$SLS_READY" = false ] && [ "$STACK_READY" = false ]; then
   echo "    yarn kbn-dev-ctl logs essls --grep ERROR"
   echo "    yarn kbn-dev-ctl logs esstack --grep ERROR"
   echo ""
+  check_docker_auth_error "$ESSLS_LOG"
   echo "  Common causes: Docker not running, bootstrap needed (--clean), node mismatch."
   echo ""
   cleanup
@@ -1141,7 +1158,7 @@ if [ "$SLS_READY" = false ] || [ "$STACK_READY" = false ]; then
   echo ""
   if [ "$SLS_READY" = false ]; then
     echo "  WARNING: Kibana Serverless failed to start."
-    echo "    Check: yarn kbn-dev-ctl logs essls --grep ERROR"
+    check_docker_auth_error "$ESSLS_LOG" || echo "    Check: kbn-dev-ctl logs essls --grep ERROR"
   fi
   if [ "$STACK_READY" = false ]; then
     echo "  WARNING: Kibana Stateful failed to start."
