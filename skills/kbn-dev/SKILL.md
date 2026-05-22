@@ -53,7 +53,7 @@ Components: `essls`, `esstack`, `optimizer`, `kbnsls`, `kbnstack`, `main`, `all`
 Check status first. If already running, tell the user. If not:
 
 1. Say: "Spinning up Kibana, standby... (run /kbn-dev-status to check)"
-2. Run `kbn-dev --quiet` in background.
+2. Run `kbn-dev --quiet` in background. To pin the stateful ES version, add `--es-version <ver>` using a full patch version like `9.3.3` (script strips a trailing `-SNAPSHOT` if present); only affects stack ES via `yarn es snapshot`, not serverless.
 3. Poll silently:
    ```bash
    for i in $(seq 1 40); do
@@ -66,11 +66,32 @@ Check status first. If already running, tell the user. If not:
      if [ "$is_running" = "0" ] && [ $i -gt 2 ]; then break; fi
    done
    ```
-4. Report: both ready → URLs. Neither → "check logs". One failed → offer restart.
+4. Report: both ready → URLs + "Chrome opened for both". Neither → "check logs". One failed → offer restart.
 
 State progression: `starting` → `es_starting` → `optimizer_ready` → `running`.
 
 **Never** show raw JSON or intermediate polls. One message at start, one when done.
+
+## Chrome auto-open
+
+`kbn-dev` opens two Chrome windows with isolated profiles (`kbn-sls`, `kbn-stack`) once each Kibana instance becomes available — works both interactively and when invoked by an agent. Missing profile dirs are auto-created on first run (no prompt in non-interactive mode).
+
+After the poll completes, verify Chrome actually launched:
+```bash
+pgrep -c -f "user-data-dir=.*kbn-(sls|stack)"
+```
+Expect both profiles represented (count ≥ 2 — Chrome's main+helper processes usually push this much higher). Also visible in `~/.kbn-dev/logs/main.log` as `Opening Chrome: <url>` lines. If neither shows:
+- Check whether `SKIP_BROWSER_LAUNCH` is set, or Chrome isn't on PATH.
+- Fall back to telling the user the URLs and to open them manually.
+- Do NOT re-launch Chrome from the skill — the script already attempts it; duplicating creates extra windows.
+
+## Updating kbn-dev / skill
+
+The installed `kbn-dev`, `kbn-dev-ctl`, and skill are **copies** placed by `install.sh`. To deploy edits, modify the source in `~/workplace/kbn-dev-tools/` and run:
+```bash
+cd ~/workplace/kbn-dev-tools && KBN_DEV_INSTALL_MODE=copy ./install.sh
+```
+Never edit `/Users/wildmat/.local/bin/kbn-dev*` or `/Users/wildmat/.claude/skills/kbn-dev/*` directly — those get clobbered on the next install.
 
 ## Viewing logs
 

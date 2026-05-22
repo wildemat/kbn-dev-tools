@@ -322,7 +322,7 @@ restart_kibana_only() {
 
   local es_stack_port="${KBN_DEV_ES_STACK_PORT:-9201}"
   local es_stack_license="${KBN_DEV_ES_STACK_LICENSE:-trial}"
-  local stack_mock_idp_flags=""
+  local stack_mock_idp_flags="--server.basePath=/kbn"
   if [ "$es_stack_license" = "basic" ]; then
     stack_mock_idp_flags="--mockIdpPlugin.enabled=false --no-base-path"
   fi
@@ -394,9 +394,25 @@ restart_kibana_only() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] --- $label restart (kibana-only) ---" > "$logfile"
 
     echo "  Starting $label..."
+    # Activate the kibana repo's required node version BEFORE yarn runs;
+    # otherwise yarn fails the engine check (this script's outer setup_node
+    # ran before we knew the kbn_dir, so .nvmrc wasn't visible yet).
+    local node_activate='
+      if [ -s "${NVM_DIR:-$HOME/.nvm}/nvm.sh" ]; then
+        export NVM_DIR="${NVM_DIR:-$HOME/.nvm}"
+        . "$NVM_DIR/nvm.sh" --no-use
+        [ -f .nvmrc ] && nvm use --silent 2>/dev/null || true
+      elif command -v fnm >/dev/null 2>&1; then
+        eval "$(fnm env --shell bash 2>/dev/null)" || true
+        [ -f .nvmrc ] && fnm use --silent-if-unchanged 2>/dev/null || true
+      elif command -v mise >/dev/null 2>&1; then
+        eval "$(mise activate bash 2>/dev/null)" || true
+      fi
+    '
     if [ "$target" = "serverless" ]; then
       nohup bash -c "
         cd \"$kbn_dir\" || exit 1
+        $node_activate
         export KBN_OPTIMIZER_USE_MAX_AVAILABLE_RESOURCES=false
         exec yarn serverless-es \
           --server.port=5601 \
@@ -405,6 +421,7 @@ restart_kibana_only() {
     else
       nohup bash -c "
         cd \"$kbn_dir\" || exit 1
+        $node_activate
         export KBN_OPTIMIZER_USE_MAX_AVAILABLE_RESOURCES=false
         exec yarn start \
           --elasticsearch \"http://localhost:$es_stack_port\" \

@@ -313,13 +313,20 @@ fi
 # --- Parse flags ------------------------------------------------------------
 CLEAN_CACHE=false
 SHOW_LOGS=true
-for arg in "$@"; do
-  case $arg in
-    --clean)        CLEAN_CACHE=true; shift ;;
-    --quiet) SHOW_LOGS=false; shift ;;
-    *) ;;
+KBN_DEV_ES_VERSION="${KBN_DEV_ES_VERSION:-}"
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --clean)          CLEAN_CACHE=true; shift ;;
+    --quiet)          SHOW_LOGS=false; shift ;;
+    --es-version)     KBN_DEV_ES_VERSION="$2"; shift 2 ;;
+    --es-version=*)   KBN_DEV_ES_VERSION="${1#--es-version=}"; shift ;;
+    *)                shift ;;
   esac
 done
+# The snapshot CI URL is keyed by bare version (no -SNAPSHOT suffix); strip it
+# so common inputs like "9.3.3-SNAPSHOT" resolve correctly.
+KBN_DEV_ES_VERSION="${KBN_DEV_ES_VERSION%-SNAPSHOT}"
+KBN_DEV_ES_VERSION="${KBN_DEV_ES_VERSION%-snapshot}"
 
 # --- Chrome profile setup --------------------------------------------------
 LAUNCH_BROWSER=true
@@ -414,7 +421,7 @@ open_chrome() {
   local url="$1" profile="$2"
   LAST_CHROME_PID=""
   if [ "$LAUNCH_BROWSER" = true ]; then
-    log_step "Opening Chrome: $url (profile: $(basename "$profile"))"
+    log_step "Opening Chrome: $url (profile: $(basename "$profile"))" "$MAIN_LOG"
     if [[ "$OSTYPE" == darwin* ]]; then
       open -na "Google Chrome" --args --new-window --user-data-dir="$profile" "$url" &
     else
@@ -495,6 +502,11 @@ cleanup() {
       kill "$port_pid" 2>/dev/null || true
     fi
   done
+
+  # Kill any "scripts/kibana --dev" processes — the dev-mode proxy spawns an
+  # inner Kibana on a random port (e.g. 5603). It survives port-5601/5611 kills
+  # if it gets re-parented, then blocks the next start with a port-in-use FATAL.
+  pkill -f "scripts/kibana --dev" 2>/dev/null || true
 
   # Kill tracked PIDs and their children
   for pid in $KBNSLS_PID $KBNSTACK_PID $OPTIMIZER_PID $ESSLS_PID $ESSTACK_PID; do
@@ -698,7 +710,7 @@ echo "  Repo:      $KBN_DIR"
 echo "  Clean:     $CLEAN_CACHE"
 echo "  EIS:       $([ "$CCM_ENABLED" = true ] && echo "enabled ($KBN_DEV_INFERENCE_URL)" || echo "disabled")"
 echo "  ES SLS:    projectType=$KBN_DEV_ES_SLS_PROJECT_TYPE"
-echo "  ES Stack:  license=$KBN_DEV_ES_STACK_LICENSE, ml=$KBN_DEV_ES_STACK_ML_ENABLED, saml=$([ -z "$STACK_MOCK_IDP_FLAGS" ] && echo "enabled" || echo "disabled")"
+echo "  ES Stack:  license=$KBN_DEV_ES_STACK_LICENSE, ml=$KBN_DEV_ES_STACK_ML_ENABLED, saml=$([ "$KBN_DEV_ES_STACK_LICENSE" = "basic" ] && echo "disabled" || echo "enabled")$([ -n "$KBN_DEV_ES_VERSION" ] && echo ", version=$KBN_DEV_ES_VERSION")"
 echo "  Optimizer: $([ "$KBN_USE_RSPACK" = "true" ] || [ "$KBN_USE_RSPACK" = "1" ] && echo "rspack" || echo "webpack (legacy)")"
 echo "  Browser:   $([ "$LAUNCH_BROWSER" = true ] && echo "Chrome (kbn-sls + kbn-stack profiles)" || echo "disabled")"
 echo "  Show logs: $SHOW_LOGS"
@@ -851,6 +863,7 @@ log_step "Starting ES Stateful (snapshot)..." "$ESSTACK_LOG"
   yarn es snapshot \
     --license "$KBN_DEV_ES_STACK_LICENSE" --clean \
     --kibanaUrl "$STACK_KBN_URL" \
+    ${KBN_DEV_ES_VERSION:+--version "$KBN_DEV_ES_VERSION"} \
     -E http.port=$KBN_DEV_ES_STACK_PORT \
     -E transport.port=$KBN_DEV_ES_STACK_TRANSPORT_PORT \
     -E xpack.ml.enabled="$KBN_DEV_ES_STACK_ML_ENABLED" \
@@ -987,6 +1000,14 @@ fi
 USE_RSPACK=false
 if [ "$KBN_USE_RSPACK" = "true" ] || [ "$KBN_USE_RSPACK" = "1" ]; then
   USE_RSPACK=true
+fi
+# Auto-fallback: older branches (≤9.3) don't ship build_rspack_bundles.js.
+# If rspack is requested but the script is missing, fall back to webpack.
+if [ "$USE_RSPACK" = true ] && [ ! -f "$KBN_DIR/scripts/build_rspack_bundles.js" ]; then
+  if [ -f "$KBN_DIR/scripts/build_kibana_platform_plugins.js" ]; then
+    log_step "build_rspack_bundles.js not found in this branch — falling back to webpack optimizer."
+    USE_RSPACK=false
+  fi
 fi
 
 if [ "$USE_RSPACK" = true ]; then
