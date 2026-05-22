@@ -6,7 +6,7 @@ Reference for diagnosing and fixing common kbn-dev startup and runtime failures.
 
 ### All processes die immediately
 
-**Symptom:** `yarn kbn-dev-ctl status` shows everything down, logs are nearly empty.
+**Symptom:** `kbn-dev-ctl status` shows everything down, logs are nearly empty.
 
 **Likely cause:** Wrong Node.js version. Agent shells don't load nvm, so
 the system node doesn't match kibana's `.nvmrc`.
@@ -15,7 +15,7 @@ the system node doesn't match kibana's `.nvmrc`.
 ```bash
 # Source nvm first (required for all yarn commands in agent shells)
 source "${NVM_DIR:-$HOME/.nvm}/nvm.sh" --no-use && nvm use --silent
-yarn kbn-dev-ctl logs main --grep "incompatible\|Expected version"
+kbn-dev-ctl logs main --grep "incompatible\|Expected version"
 # If node mismatch: nvm install $(cat .nvmrc)
 ```
 
@@ -32,8 +32,8 @@ yarn kbn-dev-ctl logs main --grep "incompatible\|Expected version"
 **Fix:**
 ```bash
 docker ps                                    # verify Docker is running
-yarn kbn-dev-ctl logs essls --grep "error"   # check specific error
-# Restart with clean: yarn kbn-dev --clean
+kbn-dev-ctl logs essls --grep "error"   # check specific error
+# Restart with clean: kbn-dev --clean
 ```
 
 ### uiam container fails to start (serverless)
@@ -49,9 +49,9 @@ containers and the network automatically on startup, and retries up to
 
 **Fix if it persists:**
 ```bash
-yarn kbn-dev-ctl stop
+kbn-dev-ctl stop
 docker system prune -a    # nuclear option: clears all Docker state
-yarn kbn-dev
+kbn-dev
 ```
 
 ### Bootstrap fails
@@ -65,11 +65,11 @@ yarn kbn-dev
 
 **Fix:**
 ```bash
-yarn kbn-dev-ctl logs main --tail 100       # check bootstrap output
+kbn-dev-ctl logs main --tail 100       # check bootstrap output
 # Clean rebuild:
-yarn kbn-dev-ctl stop
+kbn-dev-ctl stop
 yarn kbn clean && yarn kbn bootstrap
-yarn kbn-dev --quiet &
+kbn-dev --quiet &
 ```
 
 ### Optimizer dies
@@ -80,10 +80,10 @@ yarn kbn-dev --quiet &
 
 **Fix:**
 ```bash
-yarn kbn-dev-ctl logs optimizer --tail 100
+kbn-dev-ctl logs optimizer --tail 100
 # Usually requires fixing the code error, then:
-yarn kbn-dev-ctl stop
-yarn kbn-dev --quiet &
+kbn-dev-ctl stop
+kbn-dev --quiet &
 ```
 
 ## Runtime failures
@@ -94,8 +94,8 @@ yarn kbn-dev --quiet &
 
 **Fix:**
 ```bash
-yarn kbn-dev-ctl stop
-yarn kbn-dev --quiet --clean &
+kbn-dev-ctl stop
+kbn-dev --quiet --clean &
 ```
 
 ### Port already in use
@@ -104,7 +104,7 @@ yarn kbn-dev --quiet --clean &
 
 **Fix:**
 ```bash
-yarn kbn-dev-ctl restart kbnsls   # or kbnstack for port 5611
+kbn-dev-ctl restart kbnsls   # or kbnstack for port 5611
 ```
 
 The restart command kills the orphaned process and the monitor loop
@@ -116,7 +116,7 @@ restarts Kibana automatically.
 
 **Check:**
 ```bash
-yarn kbn-dev-ctl logs kbnsls --tail 20 --grep "status\|ERROR\|FATAL"
+kbn-dev-ctl logs kbnsls --tail 20 --grep "status\|ERROR\|FATAL"
 curl -s -o /dev/null -w "%{http_code}" http://localhost:5601/api/status
 ```
 
@@ -131,11 +131,11 @@ errors in the main log.
 **Fix:**
 ```bash
 # Option 1: disable EIS entirely
-KBN_INFERENCE_URL="" yarn kbn-dev --quiet &
+KBN_INFERENCE_URL="" kbn-dev --quiet &
 
 # Option 2: provide API key directly
 export KIBANA_EIS_CCM_API_KEY="your-key-here"
-yarn kbn-dev --quiet &
+kbn-dev --quiet &
 
 # Option 3: log in to vault first (interactive terminal)
 VAULT_ADDR=https://secrets.elastic.co:8200 vault login -method oidc

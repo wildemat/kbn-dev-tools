@@ -3,14 +3,14 @@
 # kbn-dev-ctl — query and control a kbn-dev instance
 #
 # Usage:
-#   yarn kbn-dev-ctl status [--json]            Show component health
-#   yarn kbn-dev-ctl logs <component>           Tail the last 50 lines of a component log
+#   kbn-dev-ctl status [--json]            Show component health
+#   kbn-dev-ctl logs <component>           Tail the last 50 lines of a component log
 #     [--tail N]                         Number of lines (default 50)
 #     [--follow]                         Follow (tail -f)
 #     [--grep PATTERN]                   Filter lines
-#   yarn kbn-dev-ctl restart <component>        Restart kbnsls or kbnstack
+#   kbn-dev-ctl restart <component>        Restart kbnsls or kbnstack
 #     [--kibana-only]                    Restart only Kibana, leave ES running
-#   yarn kbn-dev-ctl stop                       Stop the entire kbn-dev instance
+#   kbn-dev-ctl stop                       Stop the entire kbn-dev instance
 #
 # Components: essls, esstack, optimizer, kbnsls, kbnstack, all
 #
@@ -249,7 +249,7 @@ cmd_logs() {
   shift || true
 
   if [ -z "$comp" ]; then
-    echo "Usage: yarn kbn-dev-ctl logs <component> [--tail N] [--follow] [--grep PATTERN]"
+    echo "Usage: kbn-dev-ctl logs <component> [--tail N] [--follow] [--grep PATTERN]"
     echo "Components: essls, esstack, optimizer, kbnsls, kbnstack, main, all"
     exit 1
   fi
@@ -421,7 +421,7 @@ restart_kibana_only() {
     echo ""
   done
 
-  echo "  Use 'yarn kbn-dev-ctl status' to monitor."
+  echo "  Use 'kbn-dev-ctl status' to monitor."
 }
 
 restart_full() {
@@ -436,33 +436,25 @@ restart_full() {
   if ! [ -f "package.json" ] || ! grep -q '"name": "kibana"' package.json 2>/dev/null; then
     echo ""
     echo "  Stopped. To start again, run from the kibana repo root:"
-    echo "    yarn kbn-dev"
+    echo "    kbn-dev"
     return
   fi
 
-  if ! command -v kbn >/dev/null 2>&1 && ! [ -f "scripts/kbn_dev.sh" ]; then
+  if ! command -v kbn-dev >/dev/null 2>&1; then
     echo ""
-    echo "  Stopped. To start again: yarn kbn-dev"
+    echo "  Stopped. kbn-dev is not on PATH — reinstall to fix."
     return
   fi
 
   echo ""
   if [ -t 0 ]; then
     echo "  Starting kbn-dev..."
-    if [ -f "scripts/kbn_dev.sh" ]; then
-      exec bash scripts/kbn_dev.sh
-    else
-      exec kbn
-    fi
+    exec kbn-dev
   else
     echo "  Starting kbn-dev in background..."
-    if [ -f "scripts/kbn_dev.sh" ]; then
-      bash scripts/kbn_dev.sh --quiet &
-    else
-      kbn --quiet &
-    fi
+    kbn-dev --quiet &
     echo "  PID: $!"
-    echo "  Use 'yarn kbn-dev-ctl status' to monitor."
+    echo "  Use 'kbn-dev-ctl status' to monitor."
   fi
 }
 
@@ -485,7 +477,7 @@ cmd_restart() {
   done
 
   if [ "$comp" != "kbnsls" ] && [ "$comp" != "kbnstack" ] && [ "$comp" != "serverless" ] && [ "$comp" != "stateful" ] && [ "$comp" != "all" ]; then
-    echo "Usage: yarn kbn-dev-ctl restart <serverless|stateful|all> [--kibana-only]"
+    echo "Usage: kbn-dev-ctl restart <serverless|stateful|all> [--kibana-only]"
     echo ""
     echo "  Restarts the given mode. By default restarts both ES and Kibana."
     echo "  --kibana-only   Restart only Kibana, leaving ES running."
@@ -527,7 +519,7 @@ case "${1:-status}" in
   restart) shift; cmd_restart "$@" ;;
   stop)    cmd_stop ;;
   -h|--help|help)
-    echo "Usage: yarn kbn-dev-ctl <command> [options]"
+    echo "Usage: kbn-dev-ctl <command> [options]"
     echo ""
     echo "Commands:"
     echo "  status [--json]              Show component health"
@@ -546,7 +538,7 @@ case "${1:-status}" in
     ;;
   *)
     echo "Unknown command: $1" >&2
-    echo "Run 'yarn kbn-dev-ctl help' for usage." >&2
+    echo "Run 'kbn-dev-ctl help' for usage." >&2
     exit 1
     ;;
 esac

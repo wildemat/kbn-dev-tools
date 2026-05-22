@@ -3,13 +3,13 @@
 # kbn-dev — spin up Kibana + Elasticsearch for both serverless and stateful
 #
 # Run from the ROOT of your kibana repo checkout:
-#   yarn kbn-dev
+#   kbn-dev
 #
 # Configuration:
-#   The installer creates a .env file in the kbn-dev-tools repo root.
-#   Edit it to override defaults. It is gitignored and sourced automatically
-#   on startup via KBN_DEV_ENV_FILE (set by the installer in your shell profile).
-#   See .env.dev for all available variables with descriptions.
+#   The installer creates ~/.kbn-dev/.env from the .env.dev template.
+#   Edit it to override defaults. It is sourced automatically on startup via
+#   KBN_DEV_ENV_FILE (set by the installer in your shell profile).
+#   See .env.dev (shipped with the installer) for all variables with descriptions.
 #
 # Environment variables (can also be set in .env):
 #   CHROME_BIN                   Path to Chrome. Auto-detected if not set.
@@ -242,7 +242,7 @@ fi
 # --- Repo root check -------------------------------------------------------
 if [ ! -f "package.json" ] || ! grep -q '"name": "kibana"' package.json 2>/dev/null; then
   echo "ERROR: This script must be run from the root of the kibana repo."
-  echo "  yarn kbn-dev"
+  echo "  kbn-dev"
   exit 1
 fi
 KBN_DIR="$(pwd)"
@@ -1315,8 +1315,8 @@ if [ "$SLS_READY" = false ] && [ "$STACK_READY" = false ]; then
   echo "============================================="
   echo ""
   echo "  Neither Kibana instance came up. Check the logs:"
-  echo "    yarn kbn-dev-ctl logs essls --grep ERROR"
-  echo "    yarn kbn-dev-ctl logs esstack --grep ERROR"
+  echo "    kbn-dev-ctl logs essls --grep ERROR"
+  echo "    kbn-dev-ctl logs esstack --grep ERROR"
   echo ""
   check_docker_auth_error "$ESSLS_LOG"
   echo "  Common causes: Docker not running, bootstrap needed (--clean), node mismatch."
@@ -1332,7 +1332,7 @@ if [ "$SLS_READY" = false ] || [ "$STACK_READY" = false ]; then
   fi
   if [ "$STACK_READY" = false ]; then
     echo "  WARNING: Kibana Stateful failed to start."
-    echo "    Check: yarn kbn-dev-ctl logs esstack --grep ERROR"
+    echo "    Check: kbn-dev-ctl logs esstack --grep ERROR"
   fi
   echo "  Continuing with available instance(s)."
   echo ""
