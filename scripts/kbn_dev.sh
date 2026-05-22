@@ -457,6 +457,7 @@ ESSLS_PID=""
 ESSTACK_PID=""
 KBNSLS_PID=""
 KBNSTACK_PID=""
+WATCHDOG_PID=""
 SLS_CHROME_PID=""
 STACK_CHROME_PID=""
 
@@ -466,6 +467,12 @@ cleanup() {
   set +m 2>/dev/null
   echo ""
   echo "Stopping all processes..."
+
+  # Kill the watchdog FIRST so it can't trigger a restart mid-shutdown
+  # (which would spawn an orphan nohup'd Kibana).
+  if [ -n "$WATCHDOG_PID" ] && kill -0 "$WATCHDOG_PID" 2>/dev/null; then
+    kill "$WATCHDOG_PID" 2>/dev/null || true
+  fi
 
   # Chrome
   for profile_dir in "$SLS_PROFILE" "$STACK_PROFILE"; do
@@ -584,10 +591,16 @@ KBN_DEV_ES_STACK_TRANSPORT_PORT=$((KBN_DEV_ES_STACK_PORT + 100))
 
 # --- Mock IdP / SAML (stateful) ---------------------------------------------
 # PR elastic/kibana#263998 enabled SAML Mock IdP for stateful by default.
-# `yarn es snapshot` auto-configures a SAML realm whose SP/ACS URLs must match
-# Kibana's host:port/basePath. The fixed basePath is /kbn (MOCK_IDP_KIBANA_BASE_PATH).
+# `yarn es snapshot` auto-configures a SAML realm whose SP/ACS URLs match
+# Kibana at MOCK_IDP_KIBANA_BASE_PATH (=/kbn). However, in `--dev` mode the
+# kbn-cli-dev-mode base-path proxy generates a *random* 3-char basePath
+# (e.g. /jui, /vlr) and passes it via CLI override, which wins over the
+# mockIdpPlugin's attempt to pin /kbn. The result: SAML SP/ACS endpoints
+# point at /kbn but Kibana serves at /jui — login flow + Chrome both broken.
+# Fix: pin --server.basePath=/kbn explicitly so the dev proxy uses that value
+# (http1.ts:41 honors httpConfig.basePath when set).
 # For basic license, SAML is unsupported — disable the plugin + basePath entirely.
-STACK_MOCK_IDP_FLAGS=""
+STACK_MOCK_IDP_FLAGS="--server.basePath=/kbn"
 STACK_KBN_URL="http://localhost:5611/kbn"
 if [ "$KBN_DEV_ES_STACK_LICENSE" = "basic" ]; then
   STACK_MOCK_IDP_FLAGS="--mockIdpPlugin.enabled=false --no-base-path"
@@ -849,6 +862,108 @@ ESSTACK_PID=$!
 write_status "es_starting"
 
 # =============================================================================
+# Process supervisors (used by both optimizer and Kibana pipelines)
+# =============================================================================
+
+needs_bootstrap() {
+  local logfile="$1"
+  local tail_lines
+  tail_lines=$(tail -80 "$logfile" 2>/dev/null)
+  if echo "$tail_lines" | grep -qE "Cannot find module|MODULE_NOT_FOUND|ENOENT.*node_modules"; then
+    return 0
+  fi
+  return 1
+}
+
+run_bootstrap() {
+  local clean="$1"
+  log_step "Running auto-bootstrap (clean=$clean)..." "$MAIN_LOG"
+  (
+    cd "$KBN_DIR" || return 1
+    if [ "$clean" = true ]; then
+      yarn kbn clean >> "$MAIN_LOG" 2>&1 || true
+    fi
+    yarn kbn bootstrap >> "$MAIN_LOG" 2>&1
+  )
+  return $?
+}
+
+monitor_process() {
+  local name="$1" start_fn="$2" logfile="$3" kick_sentinel="${4:-}"
+  local failures=0 max_failures=3
+  local bootstrap_attempts=0 max_bootstrap=2
+
+  while true; do
+    $start_fn &
+    local pid=$!
+    wait $pid
+    local exit_code=$?
+
+    # Watchdog kick? Sentinel turns a clean-looking SIGTERM/SIGINT into a
+    # restart-needing crash so we don't confuse it with user shutdown.
+    local kicked=false
+    if [ -n "$kick_sentinel" ] && [ -f "$kick_sentinel" ]; then
+      kicked=true
+      rm -f "$kick_sentinel"
+      log_step "$name received watchdog kick — treating as crash, running recovery" "$logfile"
+    fi
+
+    if { [ $exit_code -eq 130 ] || [ $exit_code -eq 143 ]; } && [ "$kicked" = false ]; then
+      break
+    elif [ $exit_code -ne 0 ] || [ "$kicked" = true ]; then
+      # Watchdog kicks have their own outer cap; don't double-count them
+      # against the monitor's crash budget (would falsely trip max_failures
+      # and bring down kbn-dev for an issue the user can fix in-place).
+      if [ "$kicked" = false ]; then
+        failures=$((failures + 1))
+        log_step "$name exited with code $exit_code (attempt $failures/$max_failures)" "$logfile"
+      fi
+
+      if needs_bootstrap "$logfile"; then
+        bootstrap_attempts=$((bootstrap_attempts + 1))
+        if [ $bootstrap_attempts -le $max_bootstrap ]; then
+          local do_clean=false
+          [ $bootstrap_attempts -gt 1 ] && do_clean=true
+          log_step "$name crashed due to missing module — auto-bootstrapping (attempt $bootstrap_attempts/$max_bootstrap, clean=$do_clean)..." "$logfile"
+          if run_bootstrap "$do_clean"; then
+            log_step "Bootstrap succeeded. Restarting $name..."
+            [ "$failures" -gt 0 ] && failures=$((failures - 1))
+            sleep 2
+            continue
+          else
+            log_step "Bootstrap failed. Check $MAIN_LOG" "$logfile"
+          fi
+        else
+          log_step "$name still failing after $max_bootstrap bootstrap attempts." "$logfile"
+        fi
+      fi
+
+      if [ $failures -lt $max_failures ]; then
+        log_step "Restarting $name in 5s..."
+        sleep 5
+      else
+        log_step "$name exceeded max organic retries ($max_failures). Monitor exiting; watchdog still active for future kicks." "$logfile"
+        break
+      fi
+    else
+      log_step "$name exited cleanly (code 0)"
+      break
+    fi
+  done
+}
+
+start_rspack_optimizer() {
+  kill_port 5678
+  cd "$KBN_DIR" || return 1
+  node scripts/build_rspack_bundles.js --watch
+}
+
+start_webpack_optimizer() {
+  cd "$KBN_DIR" || return 1
+  node scripts/build_kibana_platform_plugins --watch
+}
+
+# =============================================================================
 # PHASE 2: Bootstrap and build optimizer
 # =============================================================================
 
@@ -875,12 +990,8 @@ if [ "$KBN_USE_RSPACK" = "true" ] || [ "$KBN_USE_RSPACK" = "1" ]; then
 fi
 
 if [ "$USE_RSPACK" = true ]; then
-  kill_port 5678
-  log_step "Starting rspack optimizer (watch mode)..."
-  (
-    cd "$KBN_DIR" || exit 1
-    node scripts/build_rspack_bundles.js --watch
-  ) >> "$OPTIMIZER_LOG" 2>&1 &
+  log_step "Starting rspack optimizer (watch mode, supervised)..."
+  monitor_process "Rspack Optimizer" start_rspack_optimizer "$OPTIMIZER_LOG" >> "$OPTIMIZER_LOG" 2>&1 &
   OPTIMIZER_PID=$!
 
   log_step "Waiting for rspack initial build..."
@@ -888,15 +999,12 @@ if [ "$USE_RSPACK" = true ]; then
     log_step "Rspack optimizer build complete!"
   fi
 else
-  log_step "Starting webpack optimizer (watch mode)..."
-  (
-    cd "$KBN_DIR" || exit 1
-    node scripts/build_kibana_platform_plugins --watch
-  ) >> "$OPTIMIZER_LOG" 2>&1 &
+  log_step "Starting webpack optimizer (watch mode, supervised)..."
+  monitor_process "Webpack Optimizer" start_webpack_optimizer "$OPTIMIZER_LOG" >> "$OPTIMIZER_LOG" 2>&1 &
   OPTIMIZER_PID=$!
 
   log_step "Waiting for optimizer initial build..."
-  if wait_for_log "$OPTIMIZER_LOG" "succ.*bundles compiled successfully\|succ all bundles cached" "$OPTIMIZER_PID" "Optimizer"; then
+  if wait_for_log "$OPTIMIZER_LOG" "succ.*bundles compiled successfully\|succ all bundles cached" "$OPTIMIZER_PID" "Webpack Optimizer"; then
     log_step "Optimizer build complete!"
   fi
 fi
@@ -935,78 +1043,136 @@ start_kbnstack() {
   ) >> "$KBNSTACK_LOG" 2>&1
 }
 
-needs_bootstrap() {
-  local logfile="$1"
-  local tail_lines
-  tail_lines=$(tail -80 "$logfile" 2>/dev/null)
-  if echo "$tail_lines" | grep -qE "Cannot find module|MODULE_NOT_FOUND|ENOENT.*node_modules"; then
-    return 0
-  fi
-  return 1
+# HTTP-based liveness check. Port-open alone isn't reliable: the yarn dev-mode
+# wrapper holds the port even when the inner node Kibana has crashed, so lsof
+# reports the port as listening while curl gets connection errors or 503.
+# Uses -L so the basePath redirect (e.g. /vlr/api/status when SAML Mock IdP
+# generates a random basePath) is followed transparently; we only care that
+# the final response is 200.
+# Returns 0 if Kibana is actually serving, 1 otherwise.
+kbn_responsive() {
+  local base_url="$1"
+  local code
+  code=$(curl -sLk -o /dev/null --max-time 4 -w '%{http_code}' "$base_url/api/status" 2>/dev/null || echo "000")
+  [ "$code" = "200" ]
 }
 
-run_bootstrap() {
-  local clean="$1"
-  log_step "Running auto-bootstrap (clean=$clean)..." "$MAIN_LOG"
-  (
-    cd "$KBN_DIR" || return 1
-    if [ "$clean" = true ]; then
-      yarn kbn clean >> "$MAIN_LOG" 2>&1 || true
-    fi
-    yarn kbn bootstrap >> "$MAIN_LOG" 2>&1
-  )
-  return $?
-}
-
-monitor_process() {
-  local name="$1" start_fn="$2" logfile="$3"
-  local failures=0 max_failures=3
-  local bootstrap_attempts=0 max_bootstrap=2
-
-  while true; do
-    $start_fn &
-    local pid=$!
-    wait $pid
-    local exit_code=$?
-
-    if [ $exit_code -eq 130 ] || [ $exit_code -eq 143 ]; then
-      break
-    elif [ $exit_code -ne 0 ]; then
-      failures=$((failures + 1))
-      log_step "$name exited with code $exit_code (attempt $failures/$max_failures)" "$logfile"
-
-      if needs_bootstrap "$logfile"; then
-        bootstrap_attempts=$((bootstrap_attempts + 1))
-        if [ $bootstrap_attempts -le $max_bootstrap ]; then
-          local do_clean=false
-          [ $bootstrap_attempts -gt 1 ] && do_clean=true
-          log_step "$name crashed due to missing module — auto-bootstrapping (attempt $bootstrap_attempts/$max_bootstrap, clean=$do_clean)..." "$logfile"
-          if run_bootstrap "$do_clean"; then
-            log_step "Bootstrap succeeded. Restarting $name..."
-            failures=$((failures - 1))
-            sleep 2
-            continue
-          else
-            log_step "Bootstrap failed. Check $MAIN_LOG" "$logfile"
-          fi
-        else
-          log_step "$name still failing after $max_bootstrap bootstrap attempts." "$logfile"
-        fi
-      fi
-
-      if [ $failures -lt $max_failures ]; then
-        log_step "Restarting $name in 5s..."
-        sleep 5
-      else
-        log_step "$name exceeded max retries ($max_failures). Giving up."
-        kill $$ 2>/dev/null
-        exit 1
-      fi
-    else
-      log_step "$name exited cleanly (code 0)"
-      break
-    fi
+# Best-effort recursive kill of a pid and all its descendants (leaf-first
+# so children die before their parent can spawn replacements).
+kill_pid_tree() {
+  local pid="$1" signal="${2:-TERM}"
+  [ -z "$pid" ] && return
+  local child
+  for child in $(pgrep -P "$pid" 2>/dev/null); do
+    kill_pid_tree "$child" "$signal"
   done
+  kill -"$signal" "$pid" 2>/dev/null || true
+}
+
+# Kick monitor_process by killing its inner start_fn subshell AND all descendants
+# (yarn, node, etc.) — otherwise yarn often survives as an orphan and its
+# internal dev-mode watcher keeps trying to restart Kibana. A sentinel file is
+# touched first so monitor_process can distinguish this from a real shutdown
+# (Ctrl+C / cleanup also send SIGTERM and would otherwise yield identical exit
+# code 143). On detecting the sentinel, monitor_process runs its needs_bootstrap
+# / restart logic instead of exiting cleanly.
+# Returns 0 if a kick was sent, 1 if the monitor is gone (caller falls back to
+# a direct ctl restart).
+watchdog_kick_monitor() {
+  local pidfile="$1" label="$2"
+  local mon_pid
+  [ -f "$pidfile" ] || return 1
+  mon_pid=$(cat "$pidfile" 2>/dev/null)
+  [ -n "$mon_pid" ] && kill -0 "$mon_pid" 2>/dev/null || return 1
+  local sentinel="${pidfile%.pid}.kick"
+  touch "$sentinel"
+  # Kill descendants of the monitor (start_fn subshell + its whole tree).
+  # The monitor itself stays alive so it can run its recovery logic.
+  local sfn_pid
+  for sfn_pid in $(pgrep -P "$mon_pid" 2>/dev/null); do
+    kill_pid_tree "$sfn_pid"
+  done
+  log_step "Watchdog: kicked $label monitor (PID $mon_pid, sentinel $(basename "$sentinel")) — letting monitor_process handle recovery" "$MAIN_LOG"
+  return 0
+}
+
+watchdog_kibana() {
+  local grace="${KBN_DEV_WATCHDOG_GRACE:-60}"
+  local poll="${KBN_DEV_WATCHDOG_POLL:-30}"
+  local giveup="${KBN_DEV_WATCHDOG_GIVEUP:-180}"  # seconds to wait after kick before giving up
+
+  # Use bare host:port — kbn_responsive uses -L to follow Kibana's basePath redirect.
+  local sls_url="http://localhost:5601"
+  local stack_url="http://localhost:5611"
+
+  # Wait for at least one Kibana to respond to HTTP before monitoring.
+  local waited=0
+  while [ $waited -lt 600 ]; do
+    kbn_responsive "$sls_url" && break
+    kbn_responsive "$stack_url" && break
+    sleep 10
+    waited=$((waited + 10))
+  done
+  [ $waited -ge 600 ] && return
+
+  sleep "$grace"
+
+  # Per-instance state machine: down_since = first unix time seen unresponsive;
+  # kicked_at = time kick was sent (0 = not yet kicked); gave_up = no more action
+  # this outage. When responsive again, all reset so the next outage triggers fresh.
+  local sls_down_since=0 sls_kicked_at=0 sls_gave_up=false
+  local stack_down_since=0 stack_kicked_at=0 stack_gave_up=false
+
+  while kill -0 $$ 2>/dev/null; do
+    local now=$(date +%s)
+    watchdog_check_instance "$sls_url"   "$LOG_DIR/kbnsls.pid"   "Kibana SLS"   sls   "$grace" "$giveup" "$now" "kbnsls"
+    watchdog_check_instance "$stack_url" "$LOG_DIR/kbnstack.pid" "Kibana Stack" stack "$grace" "$giveup" "$now" "kbnstack"
+    sleep "$poll"
+  done
+}
+
+# Per-instance check. Reads/writes the caller's state vars by name (bash globals
+# via eval so we don't have to duplicate the kbnsls/kbnstack logic blocks).
+watchdog_check_instance() {
+  local url="$1" pidfile="$2" label="$3" prefix="$4" grace="$5" giveup="$6" now="$7" ctl_name="$8"
+  local down_var="${prefix}_down_since"
+  local kicked_var="${prefix}_kicked_at"
+  local gave_up_var="${prefix}_gave_up"
+
+  if kbn_responsive "$url"; then
+    eval "$down_var=0; $kicked_var=0; $gave_up_var=false"
+    return
+  fi
+
+  eval "local down=\$$down_var kicked=\$$kicked_var gave_up=\$$gave_up_var"
+
+  # First time seeing it down — start the clock.
+  if [ "$down" -eq 0 ]; then
+    eval "$down_var=$now"
+    return
+  fi
+
+  # Already gave up; just wait for it to come back on its own.
+  [ "$gave_up" = true ] && return
+
+  # Already kicked once — wait for recovery or hit give-up timer.
+  if [ "$kicked" -gt 0 ]; then
+    if [ $(( now - kicked )) -ge "$giveup" ]; then
+      log_step "Watchdog: $label still unresponsive ${giveup}s after kick — giving up. Fix source then 'kbn-dev-ctl restart $ctl_name --kibana-only'." "$MAIN_LOG"
+      eval "$gave_up_var=true"
+    fi
+    return
+  fi
+
+  # Not kicked yet — fire once after the grace period.
+  if [ $(( now - down )) -ge "$grace" ]; then
+    log_step "Watchdog: $label unresponsive $(( now - down ))s — kicking monitor (single attempt, ${giveup}s to recover)" "$MAIN_LOG"
+    if ! watchdog_kick_monitor "$pidfile" "$label"; then
+      log_step "Watchdog: $label monitor gone — falling back to ctl restart" "$MAIN_LOG"
+      kbn-dev-ctl restart "$ctl_name" --kibana-only >> "$MAIN_LOG" 2>&1 || true
+    fi
+    eval "$kicked_var=$now"
+  fi
 }
 
 wait_for_es_http() {
@@ -1065,7 +1231,11 @@ run_es_to_kibana_pipeline() {
     fi
   fi
 
-  monitor_process "$kbn_label" "$kbn_start_fn" "$kbn_log" &
+  # Sentinel path is pidfile with .pid → .kick suffix. Watchdog touches it
+  # before pkill so monitor_process can distinguish a kick from a real shutdown.
+  local kick_sentinel="${kbn_pidfile%.pid}.kick"
+  rm -f "$kick_sentinel"
+  monitor_process "$kbn_label" "$kbn_start_fn" "$kbn_log" "$kick_sentinel" &
   echo "$!" > "$kbn_pidfile"
   wait
 }
@@ -1198,5 +1368,8 @@ fi
 echo ""
 echo "============================================="
 echo "Press Ctrl+C to stop all processes."
+
+watchdog_kibana &
+WATCHDOG_PID=$!
 
 wait
