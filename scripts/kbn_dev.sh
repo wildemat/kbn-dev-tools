@@ -167,6 +167,18 @@ kill_tree() {
   fi
 }
 
+# Best-effort recursive kill of a pid and all its descendants (leaf-first
+# so children die before their parent can spawn replacements).
+kill_pid_tree() {
+  local pid="$1" signal="${2:-TERM}"
+  [ -z "$pid" ] && return
+  local child
+  for child in $(pgrep -P "$pid" 2>/dev/null); do
+    kill_pid_tree "$child" "$signal"
+  done
+  kill -"$signal" "$pid" 2>/dev/null || true
+}
+
 kill_port() {
   local port="$1"
   local pid
@@ -453,7 +465,14 @@ if [ -f "$PIDFILE" ]; then
     echo "Stopping previous kbn-dev instance (PID $OLD_PID)..."
     pkill -P "$OLD_PID" 2>/dev/null || true
     kill "$OLD_PID" 2>/dev/null || true
-    sleep 2
+    # Wait for its cleanup trap to finish (stops docker containers, kills
+    # ports) — proceeding while it runs lets it tear down OUR resources.
+    _waited=0
+    while kill -0 "$OLD_PID" 2>/dev/null && [ $_waited -lt 60 ]; do
+      sleep 1
+      _waited=$((_waited + 1))
+    done
+    unset _waited
   fi
 fi
 echo $$ > "$PIDFILE"
@@ -555,7 +574,10 @@ cleanup() {
   fi
 
   write_status "stopped"
-  rm -f "$PIDFILE" "$LOG_DIR/kbnsls.pid" "$LOG_DIR/kbnstack.pid"
+  # Only remove the pidfile if it's still ours — a replacement kbn-dev may
+  # have already written its own PID while this cleanup was running.
+  [ "$(cat "$PIDFILE" 2>/dev/null)" = "$$" ] && rm -f "$PIDFILE"
+  rm -f "$LOG_DIR/kbnsls.pid" "$LOG_DIR/kbnstack.pid"
   echo "Cleanup complete."
   exit
 }
@@ -774,6 +796,74 @@ clean_docker_sls() {
   docker network rm elastic 2>/dev/null || true
 }
 
+# The CosmosDB emulator's pgcosmos backend can stay wedged (postgres FAIL) while
+# its gateway port answers, so the cluster passes port/ES-ready checks yet UIAM
+# user-seeding — which login performs against CosmosDB — fails with a 500 ("click
+# does nothing"). Poll the emulator's own /ready until overall:true. Returns 1 on
+# timeout, or early if $watch_pid (the `yarn es serverless` launcher) has died.
+cosmos_postgres_ready() {
+  local max_wait="${1:-150}" watch_pid="${2:-}" elapsed=0
+  while [ "$elapsed" -lt "$max_wait" ]; do
+    if docker exec uiam-cosmosdb sh -c 'curl -sk http://127.0.0.1:8080/ready' 2>/dev/null \
+         | grep -q '"overall": *true'; then
+      return 0
+    fi
+    if [ -n "$watch_pid" ] && ! kill -0 "$watch_pid" 2>/dev/null; then
+      return 1
+    fi
+    sleep 3
+    elapsed=$((elapsed + 3))
+  done
+  return 1
+}
+
+# After a mid-session cluster recycle the saved-object indices are gone and a
+# running Kibana never re-runs migrations, so it must be restarted. Uses the
+# monitor kick protocol (sentinel + tree kill, see watchdog_kick_monitor) so
+# monitor_process treats it as a crash and restarts Kibana. No-op when Kibana
+# hasn't started yet (initial-startup retries).
+kick_kbnsls_monitor() {
+  local pidfile="$LOG_DIR/kbnsls.pid" mon_pid sfn_pid
+  [ -f "$pidfile" ] || return 0
+  mon_pid=$(cat "$pidfile" 2>/dev/null)
+  [ -n "$mon_pid" ] && kill -0 "$mon_pid" 2>/dev/null || return 0
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] Serverless cluster was recycled under a running Kibana — kicking kbnsls so saved-object migrations re-run."
+  touch "${pidfile%.pid}.kick"
+  for sfn_pid in $(pgrep -P "$mon_pid" 2>/dev/null); do
+    kill_pid_tree "$sfn_pid"
+  done
+}
+
+# uiam boots in parallel with uiam-cosmosdb and exits(1) if it connects before
+# pgcosmos accepts requests. Docker has no restart policy on it, so the launcher
+# then waits on a dead container until its health timeout kills the whole
+# cluster. Once CosmosDB is ready, a single `docker start` lets uiam boot
+# cleanly. Returns 0 when uiam is running+healthy; 1 on timeout, a second
+# crash, or if $watch_pid (the launcher) has died.
+uiam_ready() {
+  local max_wait="${1:-120}" watch_pid="${2:-}" elapsed=0
+  local status health restarted=false
+  while [ "$elapsed" -lt "$max_wait" ]; do
+    if [ -n "$watch_pid" ] && ! kill -0 "$watch_pid" 2>/dev/null; then
+      return 1
+    fi
+    status=$(docker inspect -f '{{.State.Status}}' uiam 2>/dev/null || echo "")
+    health=$(docker inspect -f '{{.State.Health.Status}}' uiam 2>/dev/null || echo "")
+    if [ "$status" = "running" ] && [ "$health" = "healthy" ]; then
+      return 0
+    fi
+    if [ "$status" = "exited" ]; then
+      [ "$restarted" = true ] && return 1
+      echo "[$(date '+%Y-%m-%d %H:%M:%S')] uiam exited before CosmosDB was ready (startup race) — restarting the container."
+      docker start uiam >/dev/null 2>&1 || return 1
+      restarted=true
+    fi
+    sleep 3
+    elapsed=$((elapsed + 3))
+  done
+  return 1
+}
+
 log_step "Cleaning up stale kibana-ci Docker resources..."
 if command -v docker >/dev/null 2>&1; then
   clean_docker_sls
@@ -822,11 +912,95 @@ log_step "Starting ES Serverless..." "$ESSLS_LOG"
       $INFERENCE_FLAG
   }
 
-  # Retry up to 3 times in case of uiam/cosmosdb startup race.
-  # Between attempts, tear down the Docker network so uiam gets fresh DNS.
+  # Launch the cluster, then accept it only once CosmosDB's pgcosmos backend
+  # reports healthy AND uiam is healthy — a wedged backend passes port/ES-ready
+  # checks but breaks login, and uiam can crash on the startup race (healed by
+  # uiam_ready). On failure, SIGTERM the launcher (it runs its own container
+  # teardown) so the caller recycles. On success, `wait` keeps this subshell
+  # alive for the cluster's lifetime; a nonzero launcher exit after that is
+  # still a failed attempt (except TERM/INT from kbn-dev's own shutdown).
+  # $1 caps how long to wait for pgcosmos before declaring the attempt wedged.
+  es_sls_attempt() {
+    local cosmos_wait="${1:-240}" es_run_pid rc
+    run_es_sls &
+    es_run_pid=$!
+
+    if ! cosmos_postgres_ready "$cosmos_wait" "$es_run_pid"; then
+      if kill -0 "$es_run_pid" 2>/dev/null; then
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] CosmosDB pgcosmos backend wedged (overall:false) after ${cosmos_wait}s — recycling serverless cluster."
+        kill_pid_tree "$es_run_pid"
+        wait "$es_run_pid" 2>/dev/null
+      else
+        wait "$es_run_pid" 2>/dev/null
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] ES Serverless launcher exited before ready (uiam/cosmosdb startup race)."
+      fi
+      return 1
+    fi
+
+    if ! uiam_ready 120 "$es_run_pid"; then
+      if kill -0 "$es_run_pid" 2>/dev/null; then
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] uiam container not healthy after CosmosDB became ready — recycling serverless cluster."
+        kill_pid_tree "$es_run_pid"
+        wait "$es_run_pid" 2>/dev/null
+      else
+        wait "$es_run_pid" 2>/dev/null
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] ES Serverless launcher gave up waiting for uiam (uiam/cosmosdb startup race)."
+      fi
+      return 1
+    fi
+
+    if [ "$kbn_restart_pending" = true ]; then
+      kbn_restart_pending=false
+      kick_kbnsls_monitor
+    fi
+
+    # Lifetime monitor. pgcosmos can pass the startup gate and die minutes
+    # later (observed: one 10s healthy window, then permanent FAIL) — and a
+    # bare cosmosdb container restart is NOT a fix: the emulator persists
+    # nothing, so restarting it orphans UIAM/ES token state and logins fail
+    # with "failed to authenticate cloud access token". The only clean
+    # recovery is a full cluster recycle, so on a sustained wedge (6
+    # consecutive failed checks, ~90s) kill the launcher and fail the
+    # attempt. A uiam container that exits mid-session is stateless and IS
+    # safe to docker-start back up.
+    local wedged_checks=0 uiam_status
+    while kill -0 "$es_run_pid" 2>/dev/null; do
+      if docker exec uiam-cosmosdb sh -c 'curl -sk http://127.0.0.1:8080/ready' 2>/dev/null \
+           | grep -q '"overall": *true'; then
+        wedged_checks=0
+      else
+        wedged_checks=$((wedged_checks + 1))
+      fi
+      if [ "$wedged_checks" -ge 6 ]; then
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] CosmosDB pgcosmos backend wedged mid-session (~90s of overall:false) — recycling serverless cluster."
+        kill_pid_tree "$es_run_pid"
+        wait "$es_run_pid" 2>/dev/null
+        return 1
+      fi
+      uiam_status=$(docker inspect -f '{{.State.Status}}' uiam 2>/dev/null || echo "")
+      if [ "$uiam_status" = "exited" ]; then
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] uiam container exited mid-session — restarting it."
+        docker start uiam >/dev/null 2>&1 || true
+      fi
+      sleep 15
+    done
+
+    wait "$es_run_pid"
+    rc=$?
+    case $rc in
+      0|130|143) return 0 ;;
+    esac
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] ES Serverless launcher exited with code $rc after startup — treating as failed attempt."
+    return 1
+  }
+
+  # Retry up to 3 times in case of a uiam/cosmosdb startup race or a wedged
+  # pgcosmos backend. Between attempts, tear down the Docker network so uiam
+  # gets fresh DNS.
   max_attempts=3
   attempt=0
   succeeded=false
+  kbn_restart_pending=false
   while [ $attempt -lt $max_attempts ]; do
     attempt=$((attempt + 1))
     if [ $attempt -gt 1 ]; then
@@ -836,13 +1010,15 @@ log_step "Starting ES Serverless..." "$ESSLS_LOG"
       echo "[$(date '+%Y-%m-%d %H:%M:%S')] ES Serverless attempt $attempt/$max_attempts..."
     fi
 
-    run_es_sls && { succeeded=true; break; }
+    es_sls_attempt && { succeeded=true; break; }
 
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] ES Serverless attempt $attempt/$max_attempts failed (uiam/cosmosdb startup race)."
+    kbn_restart_pending=true
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] ES Serverless attempt $attempt/$max_attempts failed."
     sleep 5
   done
 
-  # Nuclear fallback: full image purge + network teardown, then one last try.
+  # Nuclear fallback: full image purge + network teardown, then one last try
+  # (still gated on pgcosmos health).
   if [ "$succeeded" = false ]; then
     echo ""
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] All $max_attempts attempts failed. Running full Docker cleanup (equivalent to --clean)..."
@@ -851,7 +1027,7 @@ log_step "Starting ES Serverless..." "$ESSLS_LOG"
     docker rmi $(docker images -q "docker.elastic.co/kibana-ci/*" 2>/dev/null) 2>/dev/null || true
     docker volume prune -f 2>/dev/null || true
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] ES Serverless final attempt (after full cleanup)..."
-    run_es_sls
+    es_sls_attempt 300 || echo "[$(date '+%Y-%m-%d %H:%M:%S')] WARNING: CosmosDB pgcosmos still unhealthy after full cleanup — login will fail. Check: docker logs uiam-cosmosdb"
   fi
 ) >> "$ESSLS_LOG" 2>&1 &
 ESSLS_PID=$!
@@ -1076,18 +1252,6 @@ kbn_responsive() {
   local code
   code=$(curl -sLk -o /dev/null --max-time 4 -w '%{http_code}' "$base_url/api/status" 2>/dev/null || echo "000")
   [ "$code" = "200" ]
-}
-
-# Best-effort recursive kill of a pid and all its descendants (leaf-first
-# so children die before their parent can spawn replacements).
-kill_pid_tree() {
-  local pid="$1" signal="${2:-TERM}"
-  [ -z "$pid" ] && return
-  local child
-  for child in $(pgrep -P "$pid" 2>/dev/null); do
-    kill_pid_tree "$child" "$signal"
-  done
-  kill -"$signal" "$pid" 2>/dev/null || true
 }
 
 # Kick monitor_process by killing its inner start_fn subshell AND all descendants
